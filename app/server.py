@@ -1035,7 +1035,36 @@ def background_tpu_runner(req: JobStartRequest):
             if not api:
                 raise RuntimeError("Kaggle API is not authenticated. Please check your Kaggle API key in Settings.")
             api.dataset_create_version(str(staging_dir), version_notes=f"Chapter: {req.chapter_name}", dir_mode="zip")
-            log_message("Kaggle dataset successfully updated with single scan archive!")
+            log_message("Kaggle dataset upload submitted. Waiting for Kaggle backend to finish indexing...")
+            with state_lock:
+                job_state["phase_message"] = "Waiting for Kaggle dataset processing..."
+            
+            # Poll until Kaggle marks dataset version as 'ready' (preventing kernel mounting stale previous version)
+            dataset_full_slug = f"{kaggle_user}/gbd-ch-107-part2"
+            max_wait_seconds = 600  # 10 minutes max for massive datasets
+            poll_interval = 4
+            waited = 0
+            while waited < max_wait_seconds:
+                time.sleep(poll_interval)
+                waited += poll_interval
+                try:
+                    ds_status = str(api.dataset_status(dataset_full_slug)).lower()
+                    if "ready" in ds_status:
+                        log_message(f"Kaggle dataset '{dataset_full_slug}' is ready! ({waited}s)")
+                        break
+                    elif "error" in ds_status or "fail" in ds_status:
+                        raise RuntimeError(f"Kaggle dataset processing failed: {ds_status}")
+                    else:
+                        if waited % 12 == 0:
+                            log_message(f"Dataset indexing on Kaggle... ({waited}s, status: {ds_status})")
+                            with state_lock:
+                                job_state["phase_message"] = f"Kaggle indexing dataset ({waited}s)..."
+                except Exception as poll_err:
+                    if "processing failed" in str(poll_err):
+                        raise
+                    # Ignore transient status API errors during initial upload window
+                    pass
+            log_message("Kaggle dataset version confirmed ready.")
 
         # 2. Build lightweight notebook with user selected LoRAs & settings
         from scripts.make_notebook import build_notebook
