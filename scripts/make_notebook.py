@@ -24,6 +24,7 @@ def build_notebook(
     negative_prompt: str = "",
     out_notebook_path: str = "kernel_anima/tpu_image_gen_anima.ipynb"
 ):
+    max_dim = min(int(max_dim), 1440)
     prompt = prompt.strip() if (prompt and prompt.strip()) else "masterpiece, best quality, anime style, highly detailed coloring, vibrant color harmony, crisp lineart"
     negative_prompt = negative_prompt.strip() if (negative_prompt and negative_prompt.strip()) else "worst quality, low quality, blurry, artifact, oversaturated, deformed, greyscale, monochrome"
     cells = []
