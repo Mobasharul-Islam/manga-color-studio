@@ -17,7 +17,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
-from kaggle.api.kaggle_api_extended import KaggleApi
 
 # Base directories
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -827,6 +826,17 @@ class SaveSettingsRequest(BaseModel):
     hf_token: Optional[str] = None
 
 
+def get_kaggle_api_safe():
+    """Lazily imports and tests KaggleApi without raising unhandled errors."""
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        return api
+    except Exception:
+        return None
+
+
 def get_kaggle_username() -> str:
     """Dynamically resolves the authenticated Kaggle username."""
     u = os.getenv("KAGGLE_USERNAME")
@@ -840,28 +850,20 @@ def get_kaggle_username() -> str:
                 return data["username"]
     except Exception:
         pass
-    try:
-        api = KaggleApi()
-        api.authenticate()
-        if hasattr(api, "config_values") and api.config_values.get("username"):
-            return api.config_values["username"]
-    except Exception:
-        pass
+    
+    api = get_kaggle_api_safe()
+    if api and hasattr(api, "config_values") and api.config_values.get("username"):
+        return api.config_values["username"]
+    
     return "mobasharulislam"
 
 
 @app.get("/api/settings")
 def get_settings_endpoint():
     """Returns the current Kaggle and Hugging Face authentication status."""
-    is_authenticated = False
-    username = None
-    try:
-        api = KaggleApi()
-        api.authenticate()
-        is_authenticated = True
-        username = get_kaggle_username()
-    except Exception:
-        is_authenticated = False
+    api = get_kaggle_api_safe()
+    is_authenticated = api is not None
+    username = get_kaggle_username() if is_authenticated else None
 
     hf_tok = os.getenv("HF_TOKEN", "")
     return {

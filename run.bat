@@ -43,7 +43,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 :: 3. Check if core dependencies are present in .venv
-".venv\Scripts\python.exe" -c "import uvicorn, fastapi, kaggle" >nul 2>&1
+".venv\Scripts\python.exe" -c "import uvicorn, fastapi, huggingface_hub, PIL" >nul 2>&1
 if errorlevel 1 (
     echo [SETUP] Installing required dependencies into .venv ...
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt
