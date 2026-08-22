@@ -18,6 +18,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
+try:
+    from kaggle.api.kaggle_api_extended import KaggleApi
+except Exception:
+    KaggleApi = None
+
 # Base directories
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
@@ -916,9 +921,8 @@ def save_settings_endpoint(req: SaveSettingsRequest):
     env_file.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
 
     # Verify Kaggle authentication
-    try:
-        api = KaggleApi()
-        api.authenticate()
+    api = get_kaggle_api_safe()
+    if api:
         u = get_kaggle_username()
         log_message(f"Kaggle API authenticated successfully as @{u}")
         return {
@@ -927,13 +931,13 @@ def save_settings_endpoint(req: SaveSettingsRequest):
             "kaggle_username": u,
             "message": f"Successfully connected as @{u}!"
         }
-    except Exception as e:
-        log_message(f"Kaggle authentication note: {e}")
+    else:
+        log_message("Kaggle API authentication failed with provided credentials.")
         return {
             "status": "warning",
             "kaggle_authenticated": False,
-            "error": str(e),
-            "message": f"Saved credentials, but authentication returned: {e}"
+            "error": "Authentication failed",
+            "message": "Saved credentials, but Kaggle authentication failed. Please verify your username and API key."
         }
 
 
@@ -958,8 +962,9 @@ async def upload_kaggle_json_endpoint(file: UploadFile = File(...)):
         os.environ["KAGGLE_KEY"] = data["key"]
 
         # Verify
-        api = KaggleApi()
-        api.authenticate()
+        api = get_kaggle_api_safe()
+        if not api:
+            raise RuntimeError("Authentication failed with the uploaded kaggle.json")
         u = data["username"]
         log_message(f"Uploaded kaggle.json authenticated successfully as @{u}")
         return {
@@ -1026,8 +1031,9 @@ def background_tpu_runner(req: JobStartRequest):
             with open(staging_dir / "dataset-metadata.json", "w", encoding="utf-8") as f:
                 json.dump(meta, f)
 
-            api = KaggleApi()
-            api.authenticate()
+            api = get_kaggle_api_safe()
+            if not api:
+                raise RuntimeError("Kaggle API is not authenticated. Please check your Kaggle API key in Settings.")
             api.dataset_create_version(str(staging_dir), version_notes=f"Chapter: {req.chapter_name}", dir_mode="zip")
             log_message("Kaggle dataset successfully updated with single scan archive!")
 
