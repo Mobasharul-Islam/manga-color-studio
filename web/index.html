@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manga Color Studio | Distributed 8-Core TPU Cluster</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=8.0">
+</head>
+<body>
+  <div class="app-container">
+    
+    <!-- Top Studio Navbar -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/>
+            <path d="M5 3v4"/>
+            <path d="M19 17v4"/>
+            <path d="M3 5h4"/>
+            <path d="M17 19h4"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>Manga Color <span class="gradient-text">Studio</span> <span class="studio-badge">TPU v5-8</span></h1>
+          <p class="subtitle">Distributed 8-Core Hardware Parallel Pipeline • Anima Base 1.0 (2B)</p>
+        </div>
+      </div>
+
+      <div class="header-badges">
+        <button class="btn btn-outline-accent btn-sm" id="openSettingsBtn" title="Configure Kaggle & Hugging Face Tokens">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <span id="kaggleStatusText">API Tokens</span>
+        </button>
+        <div class="telemetry-chip" id="tpuStatusBadge">
+          <span class="status-dot"></span>
+          <span>8 Cores Active • 128 GB HBM</span>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="openOutputBtn" title="Open Output Folder in File Explorer">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+          <span>Output Folder</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Workspace Grid -->
+    <main class="workspace-grid">
+      
+      <!-- Left Column: Input & LoRA Configuration -->
+      <section class="panel control-panel">
+        
+        <!-- Step 1: Manga Scans Selection -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="step-number">1</span>
+              <h3>Select Manga Scans</h3>
+            </div>
+            <span class="badge" id="pageCountBadge">0 Pages</span>
+          </div>
+
+          <!-- Drag and Drop Dropzone -->
+          <div class="dropzone" id="dropzone">
+            <input type="file" id="fileInput" multiple accept="image/*, .zip, .cbz" style="display: none;">
+            <input type="file" id="folderInput" webkitdirectory directory multiple style="display: none;">
+            
+            <div class="dropzone-icon">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+            </div>
+            <h4>Drag & Drop Chapter Scans or .ZIP</h4>
+            <p>Direct native folder extraction or high-speed compressed upload</p>
+            
+            <div class="format-tags">
+              <span class="format-tag">PNG</span>
+              <span class="format-tag">JPG</span>
+              <span class="format-tag">WEBP</span>
+              <span class="format-tag">ZIP</span>
+              <span class="format-tag">CBZ</span>
+            </div>
+
+            <div class="dropzone-actions">
+              <button type="button" class="btn btn-primary btn-sm" id="selectFolderBtn">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+                Select Folder
+              </button>
+              <button type="button" class="btn btn-outline btn-sm" id="selectFilesBtn">
+                Select .Zip / Files
+              </button>
+            </div>
+          </div>
+
+          <!-- Thumbnail Strip Preview -->
+          <div class="thumbnail-preview-container" id="thumbnailContainer" style="display: none;">
+            <div class="thumbnail-header">
+              <span id="loadedFolderLabel">Loaded Pages</span>
+              <button class="btn-text-danger" id="clearPagesBtn">Clear All</button>
+            </div>
+            <div class="thumbnail-scroller" id="thumbnailList"></div>
+          </div>
+        </div>
+
+        <!-- Step 2: LoRA & Style Controls -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="step-number">2</span>
+              <h3>LoRA & Style Controls</h3>
+            </div>
+            <button type="button" class="btn btn-sm btn-outline-accent" id="toggleAddLoraBtn">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              <span>Add LoRA</span>
+            </button>
+          </div>
+
+          <!-- Zero-Wait Cloud Dataset Caching Banner -->
+          <div class="dataset-cache-bar" id="datasetCacheBar">
+            <div class="dataset-cache-info">
+              <div class="dataset-cache-title">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+                <span>Zero-Wait TPU Datasets</span>
+              </div>
+              <div class="dataset-pills">
+                <span class="pill pill-success" id="lorasDatasetPill" title="Loras_Manga_Coloring_Anima status">LoRAs: Synced</span>
+                <span class="pill pill-muted" id="modelsDatasetPill" title="Models_Manga_Coloring status">Model: Checking...</span>
+              </div>
+            </div>
+            <div class="dataset-cache-actions">
+              <button type="button" class="btn-icon-link" id="syncLorasBtn" title="Sync local LoRAs to Kaggle dataset">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                <span>Sync LoRAs</span>
+              </button>
+              <button type="button" class="btn-icon-link" id="syncModelsBtn" title="Upload Anima Base model to Kaggle dataset">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                <span>Upload Model</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Add New LoRA Form Modal / Accordion -->
+          <div class="add-lora-form-card" id="addLoraForm" style="display: none; background: var(--bg-surface); border: 1px solid var(--border-active); border-radius: var(--radius-sm); padding: 14px; margin-bottom: 14px;">
+            <div class="form-card-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+              <h4 style="font-size: 0.95rem; font-weight: 600;">Add Custom LoRA</h4>
+              <button type="button" class="btn-close" id="closeAddLoraBtn" style="background: none; border: none; color: var(--text-muted); font-size: 1.2rem; cursor: pointer;">&times;</button>
+            </div>
+
+            <!-- Tab Switcher -->
+            <div class="modal-tabs" style="display: flex; gap: 8px; margin-bottom: 12px;">
+              <button type="button" class="tab-btn active" id="tabLoraLink" style="padding: 4px 12px; font-size: 0.78rem;">By Link / HF</button>
+              <button type="button" class="tab-btn" id="tabLoraUpload" style="padding: 4px 12px; font-size: 0.78rem;">Upload .safetensors</button>
+            </div>
+            
+            <!-- Pane 1: Download by Link -->
+            <div id="paneLoraLink">
+              <div class="form-group">
+                <label for="newLoraUrl">Download Link or Hugging Face Repo</label>
+                <input type="text" id="newLoraUrl" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.8rem;" placeholder="e.g. https://civitai.com/models/... or HF repo path">
+              </div>
+
+              <div class="form-group">
+                <label for="newLoraCivitaiToken">Civitai API Key <span style="font-size:0.72rem; color:var(--text-dim);">(Only if downloading mature models)</span></label>
+                <input type="password" id="newLoraCivitaiToken" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.8rem;" placeholder="Optional Civitai API Key">
+              </div>
+
+              <div class="form-row" style="display: flex; gap: 10px;">
+                <div class="form-group" style="flex: 1;">
+                  <label for="newLoraName">Display Name (Optional)</label>
+                  <input type="text" id="newLoraName" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.8rem;" placeholder="e.g. Manga Shading Pro">
+                </div>
+
+                <div class="form-group" style="width: 100px;">
+                  <label for="newLoraScale">Scale</label>
+                  <input type="number" id="newLoraScale" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.8rem;" min="0.0" max="2.0" step="0.05" value="1.0">
+                </div>
+              </div>
+
+              <div class="form-row align-center justify-between" style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px;">
+                <label class="checkbox-label" style="font-size: 0.78rem; display: flex; align-items: center; gap: 6px; color: var(--text-muted);">
+                  <input type="checkbox" id="newLoraIsTurbo">
+                  <span>Is Turbo / Fast Sampler</span>
+                </label>
+
+                <div class="form-actions" style="display: flex; gap: 8px;">
+                  <button type="button" class="btn btn-secondary btn-sm" id="cancelAddLoraBtn">Cancel</button>
+                  <button type="button" class="btn btn-primary btn-sm" id="submitAddLoraBtn">Download & Add</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Pane 2: Direct Local File Upload -->
+            <div id="paneLoraUpload" style="display: none;">
+              <div class="form-group">
+                <label>Select .safetensors from your PC</label>
+                <div class="file-upload-box" id="loraFileUploadBox" style="border: 2px dashed var(--border-card); border-radius: 8px; padding: 16px; text-align: center; cursor: pointer; background: rgba(0,0,0,0.2);">
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-bottom: 6px; color: var(--accent-cyan);"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  <div id="loraFileNameLabel" style="font-size: 0.84rem; color: var(--text-main); font-weight: 500;">Click or Drop .safetensors here</div>
+                  <input type="file" id="loraFileInput" accept=".safetensors" style="display: none;">
+                </div>
+              </div>
+
+              <div class="form-row" style="display: flex; gap: 10px;">
+                <div class="form-group" style="flex: 1;">
+                  <label for="uploadLoraName">Display Name</label>
+                  <input type="text" id="uploadLoraName" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.8rem;" placeholder="Leave empty for filename">
+                </div>
+
+                <div class="form-group" style="width: 100px;">
+                  <label for="uploadLoraScale">Scale</label>
+                  <input type="number" id="uploadLoraScale" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.8rem;" min="0.0" max="2.0" step="0.05" value="1.0">
+                </div>
+              </div>
+
+              <div class="form-row align-center justify-between" style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px;">
+                <label class="checkbox-label" style="font-size: 0.78rem; display: flex; align-items: center; gap: 6px; color: var(--text-muted);">
+                  <input type="checkbox" id="uploadLoraIsTurbo">
+                  <span>Is Turbo / Fast Sampler</span>
+                </label>
+
+                <div class="form-actions" style="display: flex; gap: 8px;">
+                  <button type="button" class="btn btn-secondary btn-sm" id="cancelUploadLoraBtn">Cancel</button>
+                  <button type="button" class="btn btn-primary btn-sm" id="submitUploadLoraBtn">Upload & Add</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="addLoraErrorMsg" class="form-error" style="display: none; color: var(--danger); font-size: 0.78rem; margin-top: 8px;"></div>
+          </div>
+
+          <!-- Dynamic LoRA Stack Container -->
+          <div class="lora-stack" id="loraStack">
+            <div class="loading-placeholder">Loading LoRAs...</div>
+          </div>
+        </div>
+
+        <!-- Step 3: Prompt & Style Steering -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="step-number">3</span>
+              <h3>Prompt & Style Steering</h3>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <div class="label-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <label for="positivePromptInput" style="margin-bottom: 0;">Positive Prompt Tags</label>
+              <button type="button" class="btn-text-action" id="resetPromptBtn" style="font-size: 0.74rem; color: var(--accent-cyan); background: none; border: none; cursor: pointer;">Reset Default</button>
+            </div>
+            <textarea id="positivePromptInput" class="form-textarea" rows="3" placeholder="Enter positive style tags or character prompts...">masterpiece, best quality, anime style, highly detailed coloring, vibrant color harmony, crisp lineart</textarea>
+          </div>
+
+          <!-- Quick Style Preset Chips -->
+          <div class="preset-chips-wrapper" style="margin-bottom: 12px;">
+            <div class="preset-chips-list">
+              <button type="button" class="preset-chip active" data-preset="default">🎨 Anime Masterpiece</button>
+              <button type="button" class="preset-chip" data-preset="shonen">🔥 Vibrant Shonen</button>
+              <button type="button" class="preset-chip" data-preset="pastel">🌸 Soft Shoujo / Pastel</button>
+              <button type="button" class="preset-chip" data-preset="cinematic">🌙 Cinematic Shading</button>
+              <button type="button" class="preset-chip" data-preset="chisa">✨ Chisa Kotegawa</button>
+            </div>
+          </div>
+
+          <!-- Collapsible Advanced Tuning -->
+          <details class="settings-collapse">
+            <summary>Advanced Settings (CFG, Resolution, Negative Prompt)</summary>
+            <div class="settings-body" style="padding-top: 10px;">
+              <div class="form-group">
+                <label for="negativePromptInput">Negative Prompt</label>
+                <textarea id="negativePromptInput" class="form-textarea" rows="2" placeholder="Negative qualities to avoid...">worst quality, low quality, blurry, artifact, oversaturated, deformed, greyscale, monochrome</textarea>
+              </div>
+
+              <div class="form-group">
+                <div class="label-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                  <label for="guidanceScaleSlider" style="margin-bottom: 0;">Guidance Scale (CFG)</label>
+                  <span class="val-badge" id="guidanceScaleVal" style="font-size: 0.78rem; font-family: var(--font-mono); font-weight: 700; color: var(--accent-cyan); background: rgba(6, 182, 212, 0.12); padding: 2px 8px; border-radius: 4px;">1.0</span>
+                </div>
+                <input type="range" class="range-slider" id="guidanceScaleSlider" min="1.0" max="5.0" step="0.1" value="1.0">
+              </div>
+
+              <div class="form-row" style="display: flex; gap: 10px;">
+                <div class="form-group" style="flex: 1;">
+                  <label for="resolutionSelect">Max Scan Dimension</label>
+                  <select id="resolutionSelect" class="form-select">
+                    <option value="1440" selected>1440p (Standard HQ Scan)</option>
+                    <option value="1024">1024p (Fast Mode)</option>
+                    <option value="1920">1920p (Ultra High-Res Spread)</option>
+                  </select>
+                </div>
+
+                <div class="form-group" style="flex: 1;">
+                  <label for="stepsSelect">Diffusion Steps</label>
+                  <select id="stepsSelect" class="form-select">
+                    <option value="8" selected>8 Steps (Turbo Optimized)</option>
+                    <option value="12">12 Steps (Enhanced Shading)</option>
+                    <option value="20">20 Steps (Maximum Quality)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <!-- Launch CTA Button -->
+          <div class="action-box">
+            <button class="btn-launch" id="startColorizeBtn">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polygon points="5 3 19 12 5 21 5 3"/>
+              </svg>
+              <span>Colorize Chapter on 8-Core TPU</span>
+            </button>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- Right Column: Studio Comparison Gallery & Monitor -->
+      <section class="panel results-panel">
+        
+        <!-- Interactive Comparison Gallery Card -->
+        <div class="card gallery-card">
+          <div class="gallery-toolbar">
+            <div class="card-title">
+              <h3>Colorized Chapter Studio</h3>
+            </div>
+            
+            <div class="gallery-tabs">
+              <select id="galleryChapterSelect" class="form-select" style="padding: 5px 10px; font-size: 0.8rem; border-radius: 6px; width: auto;"></select>
+              <button class="tab-btn active" id="tabSplitView">Split Compare</button>
+              <button class="tab-btn" id="tabSideBySide">Side-by-Side</button>
+              <button class="tab-btn" id="tabGridView">Grid View</button>
+            </div>
+          </div>
+
+          <!-- 1. Split Comparison Slider View -->
+          <div class="split-view-container" id="splitViewContainer">
+            <div class="comparison-slider" id="comparisonSlider" style="--slider-pos: 50%;">
+              <img id="compColorImg" class="comp-img comp-color" src="" alt="Colorized">
+              <div class="comp-input-wrapper" id="compResizeWrap">
+                <img id="compInputImg" class="comp-img comp-input" src="" alt="Original B&W">
+              </div>
+              <input type="range" class="comp-range-input" id="compRangeSlider" min="0" max="100" value="50" step="0.1" aria-label="Split comparison slider">
+              <div class="divider-handle" id="sliderHandle">
+                <div class="handle-line"></div>
+                <div class="handle-circle">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <polyline points="15 18 9 12 15 6"/>
+                    <polyline points="9 18 3 12 9 6"/>
+                  </svg>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <polyline points="9 18 15 12 9 6"/>
+                    <polyline points="15 18 21 12 9 6"/>
+                  </svg>
+                </div>
+                <div class="handle-line"></div>
+              </div>
+              <div class="badge-label label-bw">Original B&W Scan</div>
+              <div class="badge-label label-color">8-Core TPU Neural Color</div>
+            </div>
+
+            <!-- Page Selector Carousel for Comparison -->
+            <div class="page-selector-carousel" id="pageCarousel"></div>
+          </div>
+
+          <!-- 2. Side-by-Side Dual Stage View -->
+          <div class="side-by-side-container" id="sideBySideContainer" style="display: none;">
+            <div class="sbs-stage">
+              <div class="sbs-pane">
+                <div class="badge-label label-bw">Original B&W Scan</div>
+                <img id="sbsInputImg" src="" alt="Original Scan">
+              </div>
+              <div class="sbs-pane">
+                <div class="badge-label label-color">8-Core TPU Neural Color</div>
+                <img id="sbsColorImg" src="" alt="Colorized">
+              </div>
+            </div>
+            <div class="page-selector-carousel" id="sbsPageCarousel"></div>
+          </div>
+
+          <!-- 3. All Pages Grid View -->
+          <div class="grid-view-container" id="gridViewContainer" style="display: none;">
+            <div class="results-grid" id="resultsGrid"></div>
+          </div>
+
+        </div>
+
+        <!-- Live Multi-Phase Execution Monitor & 8-Core Visualizer -->
+        <div class="card monitor-card" id="monitorCard">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="status-dot" id="jobPulse"></span>
+              <h3 id="jobStatusTitle">Cluster Ready</h3>
+            </div>
+            <span class="badge" id="jobTimer">00:00</span>
+          </div>
+
+          <!-- Multi-Phase Visual Stepper Pipeline -->
+          <div class="phase-stepper" id="phaseStepper">
+            <div class="phase-step active" id="stepPrep">
+              <span class="phase-step-num">1</span>
+              <span class="phase-step-name">Scan Prep</span>
+            </div>
+            <div class="phase-step" id="stepPush">
+              <span class="phase-step-num">2</span>
+              <span class="phase-step-name">Kaggle Push</span>
+            </div>
+            <div class="phase-step" id="stepCompile">
+              <span class="phase-step-num">3</span>
+              <span class="phase-step-name">XLA Compile</span>
+            </div>
+            <div class="phase-step" id="stepColorize">
+              <span class="phase-step-num">4</span>
+              <span class="phase-step-name">8-Core Colorize</span>
+            </div>
+            <div class="phase-step" id="stepExport">
+              <span class="phase-step-num">5</span>
+              <span class="phase-step-name">Stitch & Sync</span>
+            </div>
+          </div>
+
+          <!-- 8-Core TPU Hardware Activity Grid -->
+          <div class="tpu-cores-grid" id="tpuCoresGrid">
+            <div class="tpu-core-chip" id="tpuCore0"><span class="tpu-core-label">TPU 0</span></div>
+            <div class="tpu-core-chip" id="tpuCore1"><span class="tpu-core-label">TPU 1</span></div>
+            <div class="tpu-core-chip" id="tpuCore2"><span class="tpu-core-label">TPU 2</span></div>
+            <div class="tpu-core-chip" id="tpuCore3"><span class="tpu-core-label">TPU 3</span></div>
+            <div class="tpu-core-chip" id="tpuCore4"><span class="tpu-core-label">TPU 4</span></div>
+            <div class="tpu-core-chip" id="tpuCore5"><span class="tpu-core-label">TPU 5</span></div>
+            <div class="tpu-core-chip" id="tpuCore6"><span class="tpu-core-label">TPU 6</span></div>
+            <div class="tpu-core-chip" id="tpuCore7"><span class="tpu-core-label">TPU 7</span></div>
+          </div>
+
+          <div class="progress-bar-container">
+            <div class="progress-bar-fill" id="progressBarFill" style="width: 0%;"></div>
+          </div>
+          <div class="progress-meta">
+            <span id="phaseMessage">Ready to start colorization</span>
+            <span id="progressPercent">0%</span>
+          </div>
+
+          <!-- Collapsible High-Tech Terminal Log -->
+          <details class="terminal-collapse">
+            <summary>Execution Terminal & TPU Kernel Logs</summary>
+            <div class="terminal-log" id="terminalLog">
+              <div class="log-line">[SYSTEM] Manga Colorization Studio initialized.</div>
+              <div class="log-line">[TPU] 8 Hardware Chips (128 GB HBM) standing by via PJRT.</div>
+            </div>
+          </details>
+        </div>
+
+      </section>
+
+    </main>
+
+    <!-- Kaggle & API Settings Modal -->
+    <div class="modal-overlay" id="settingsModal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); backdrop-filter: blur(8px); z-index: 999; justify-content: center; align-items: center; padding: 20px;">
+      <div class="modal-card" style="background: var(--bg-card); border: 1px solid var(--border-active); border-radius: var(--radius-lg); width: 100%; max-width: 540px; box-shadow: var(--shadow-glow); padding: 24px; position: relative;">
+        
+        <div class="modal-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="background: var(--accent-indigo-subtle); color: var(--accent-indigo); width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center;">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            </div>
+            <div>
+              <h3 style="font-size: 1.1rem; font-weight: 700; color: #fff; margin: 0;">API Keys & Tokens</h3>
+              <p style="font-size: 0.76rem; color: var(--text-muted); margin: 0;">Connect your Kaggle account for 8-core TPU execution</p>
+            </div>
+          </div>
+          <button type="button" class="btn-close" id="closeSettingsModalBtn" style="background: none; border: none; color: var(--text-muted); font-size: 1.4rem; cursor: pointer; line-height: 1;">&times;</button>
+        </div>
+
+        <!-- Connection Status Callout -->
+        <div class="settings-status-box" id="settingsStatusBox" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="status-dot" id="modalKaggleDot"></span>
+            <span id="modalKaggleStatusText" style="font-size: 0.85rem; font-weight: 600;">Checking Kaggle connection...</span>
+          </div>
+          <span class="val-badge" id="modalHfStatusBadge" style="font-size: 0.72rem;">HF: Not Set</span>
+        </div>
+
+        <!-- Method Tabs -->
+        <div class="modal-tabs" style="display: flex; gap: 8px; margin-bottom: 14px;">
+          <button type="button" class="tab-btn active" id="tabSettingsUpload">Upload kaggle.json</button>
+          <button type="button" class="tab-btn" id="tabSettingsManual">Enter Credentials Manually</button>
+        </div>
+
+        <!-- Pane 1: Upload kaggle.json -->
+        <div id="paneSettingsUpload">
+          <div class="dropzone" id="kaggleJsonDropzone" style="padding: 24px 16px; margin-bottom: 14px; background: rgba(0,0,0,0.25); border: 2px dashed var(--border-active); cursor: pointer;">
+            <input type="file" id="kaggleJsonFileInput" accept=".json" style="display: none;">
+            <div class="dropzone-icon" style="margin-bottom: 8px;">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--accent-cyan);"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            </div>
+            <h4 id="kaggleJsonFilenameLabel" style="font-size: 0.92rem; font-weight: 600; margin-bottom: 4px;">Drag & drop your kaggle.json here</h4>
+            <p style="font-size: 0.76rem; color: var(--text-dim); margin-bottom: 0;">or click to browse from your computer</p>
+          </div>
+          <div style="font-size: 0.75rem; color: var(--text-muted); margin-bottom: 14px;">
+            💡 <strong>How to get kaggle.json:</strong> Go to <a href="https://www.kaggle.com/settings" target="_blank" style="color: var(--accent-cyan); text-decoration: underline;">kaggle.com/settings</a> ➔ scroll to <strong>API</strong> ➔ click <strong>Create New Token</strong>.
+          </div>
+        </div>
+
+        <!-- Pane 2: Manual Credentials -->
+        <div id="paneSettingsManual" style="display: none;">
+          <div class="form-group" style="margin-bottom: 10px;">
+            <label for="inputKaggleUsername" style="font-size: 0.78rem; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; display: block;">Kaggle Username</label>
+            <input type="text" id="inputKaggleUsername" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.84rem;" placeholder="e.g. mobasharulislam">
+          </div>
+          <div class="form-group" style="margin-bottom: 14px;">
+            <label for="inputKaggleKey" style="font-size: 0.78rem; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; display: block;">Kaggle API Key</label>
+            <input type="password" id="inputKaggleKey" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.84rem;" placeholder="32-character API key">
+          </div>
+        </div>
+
+        <!-- Optional Hugging Face Token -->
+        <div class="form-group" style="margin-bottom: 16px; border-top: 1px solid var(--border-subtle); padding-top: 12px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+            <label for="inputHfToken" style="font-size: 0.78rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0;">Hugging Face Token <span style="font-size: 0.72rem; color: var(--text-dim);">(Optional / Recommended)</span></label>
+            <a href="https://huggingface.co/settings/tokens" target="_blank" style="font-size: 0.72rem; color: var(--accent-cyan); text-decoration: underline;">Get free token</a>
+          </div>
+          <input type="password" id="inputHfToken" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.84rem;" placeholder="hf_... (prevents rate limits on model downloads)">
+        </div>
+
+        <div id="settingsFeedbackMsg" style="display: none; padding: 8px 12px; border-radius: 6px; font-size: 0.78rem; margin-bottom: 12px;"></div>
+
+        <div class="modal-footer" style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button type="button" class="btn btn-secondary btn-sm" id="cancelSettingsBtn">Close</button>
+          <button type="button" class="btn btn-primary btn-sm" id="saveSettingsBtn">Save & Test Connection</button>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+
+  <script src="/app.js?v=8.1"></script>
+</body>
+</html>

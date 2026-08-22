@@ -1,0 +1,48 @@
+{
+  "loras": [
+    {
+      "id": "color_manga",
+      "name": "Color Manga Anima (Base Style)",
+      "path": "Kutches/Anim4/colorMangaAnima.safetensors",
+      "filename": "colorMangaAnima.safetensors",
+      "scale": 1.0,
+      "enabled": true,
+      "is_turbo": false,
+      "is_custom": false,
+      "description": "Transforms lineart into rich, full-color anime shading."
+    },
+    {
+      "id": "turbo_8step",
+      "name": "Anima Turbo (8-Step Fast)",
+      "path": "circlestone-labs/Anima-Official-LoRAs/anima-turbo-lora-v0.2.safetensors",
+      "filename": "anima-turbo-lora-v0.2.safetensors",
+      "scale": 1.0,
+      "enabled": true,
+      "is_turbo": true,
+      "is_custom": false,
+      "description": "Accelerates generation down to 8 steps per page on TPU."
+    },
+    {
+      "id": "chisa_kotegawa_s1_anima_lora_nochekaiser",
+      "name": "chisa-kotegawa-s1-anima-lora-nochekaiser",
+      "path": "chisa-kotegawa-s1-anima-lora-nochekaiser.safetensors",
+      "filename": "chisa-kotegawa-s1-anima-lora-nochekaiser.safetensors",
+      "scale": 1.0,
+      "enabled": false,
+      "is_turbo": false,
+      "is_custom": true,
+      "description": "Local LoRA: chisa-kotegawa-s1-anima-lora-nochekaiser.safetensors"
+    },
+    {
+      "id": "sysdeep_erina___anima_v1",
+      "name": "Sysdeep Erina - Anima v1",
+      "path": "Sysdeep_Erina - Anima v1.safetensors",
+      "filename": "Sysdeep_Erina - Anima v1.safetensors",
+      "scale": 1.0,
+      "enabled": false,
+      "is_turbo": false,
+      "is_custom": true,
+      "description": "Local LoRA: Sysdeep_Erina - Anima v1.safetensors"
+    }
+  ]
+}

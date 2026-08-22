@@ -1,0 +1,44 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Secrets, Environment & API Keys
+.env
+kaggle.json
+kaggle_token.txt
+*.pem
+*.key
+
+# Application Data & Image Directories
+input_pages/
+input_sample/
+output_app/
+temp_upload*.zip
+*.zip
+*.cbz
+
+# Kaggle dataset local staging binaries (.safetensors)
+kaggle_datasets/
+kaggle_output/
+loras/*.safetensors
+!loras/.gitkeep
+
+# Generated Notebook Output & Logs
+kernel_anima/
+output_*/
+*.log
+kaggle_execution.log
+
+# IDE & OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.gemini/
