@@ -121,8 +121,80 @@ def build_notebook(
 
     lora_fusion_block = "\n".join(lora_code_lines) if lora_code_lines else "    pass"
 
+    # Determine active Kaggle credentials for cloud auto-caching
+    kuser = None
+    kkey = ""
+    ktoken = ""
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        if hasattr(api, "config_values") and api.config_values.get("username"):
+            kuser = api.config_values.get("username")
+            kkey = api.config_values.get("key") or ""
+            ktoken = api.config_values.get("api_token") or api.config_values.get("token") or ""
+        elif api.get_config_value("username"):
+            kuser = api.get_config_value("username")
+            kkey = api.get_config_value("key") or ""
+    except Exception:
+        pass
+
+    if not ktoken:
+        ktoken = os.getenv("KAGGLE_API_TOKEN", "")
+        if not ktoken:
+            acc_tok_path = Path.home() / ".kaggle" / "access_token"
+            if acc_tok_path.exists():
+                try:
+                    ktoken = acc_tok_path.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+
+    if not kuser or kuser == "your_kaggle_username":
+        u = os.getenv("KAGGLE_USERNAME")
+        if u and u != "your_kaggle_username":
+            kuser = u
+        kkey = kkey or os.getenv("KAGGLE_KEY", "")
+
+    if not kuser or not kkey:
+        try:
+            kjson = Path.home() / ".kaggle" / "kaggle.json"
+            if kjson.exists():
+                kdata = json.loads(kjson.read_text(encoding="utf-8"))
+                kuser = kuser or kdata.get("username")
+                kkey = kkey or kdata.get("key", "")
+        except Exception:
+            pass
+
+    kuser = kuser or "mobasharulislam"
+    kkey = kkey or ""
+    ktoken = ktoken or ""
+    hf_token_val = os.getenv("HF_TOKEN", "")
+
+    # Resolve dataset IDs
+    scan_dataset_id = f"{kuser}/gbd-ch-107-part2"
+    data_sources = [{"datasetId": scan_dataset_id, "sourceType": "dataset"}]
+    dataset_sources_list = [scan_dataset_id]
+
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        user_ds = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=kuser)]
+        
+        if any("models-manga-coloring" in d.lower() for d in user_ds):
+            user_model_id = f"{kuser}/models-manga-coloring"
+            data_sources.append({"datasetId": user_model_id, "sourceType": "dataset"})
+            dataset_sources_list.append(user_model_id)
+            
+        if any("loras-manga-coloring-anima" in d.lower() for d in user_ds):
+            user_lora_id = f"{kuser}/loras-manga-coloring-anima"
+            data_sources.append({"datasetId": user_lora_id, "sourceType": "dataset"})
+            dataset_sources_list.append(user_lora_id)
+    except Exception:
+        pass
+
     # Cell 3: Pre-download & Cache
-    cell3_lines = r"""import faulthandler
+    cell3_lines = f'''import faulthandler
 import gc
 import json
 import os
@@ -142,6 +214,21 @@ from safetensors.torch import load_file
 
 faulthandler.enable()
 
+# Setup Kaggle credentials inside Kaggle notebook for cloud auto-caching
+try:
+    kdir = Path('/root/.kaggle')
+    kdir.mkdir(parents=True, exist_ok=True)
+    if {repr(ktoken)}:
+        (kdir / 'access_token').write_text({repr(ktoken)}, encoding='utf-8')
+        os.environ['KAGGLE_API_TOKEN'] = {repr(ktoken)}
+    if {repr(kuser)} and {repr(kkey)}:
+        kjson = {{"username": {repr(kuser)}, "key": {repr(kkey)}}}
+        (kdir / 'kaggle.json').write_text(json.dumps(kjson, indent=2), encoding='utf-8')
+        os.environ['KAGGLE_USERNAME'] = {repr(kuser)}
+        os.environ['KAGGLE_KEY'] = {repr(kkey)}
+except Exception:
+    pass
+
 def find_local_model():
     if os.path.exists('/kaggle/input'):
         for root, dirs, files in os.walk('/kaggle/input'):
@@ -155,7 +242,7 @@ MANGA_LORA_REPO = 'Kutches/Anim4'
 MANGA_LORA_FILE = 'colorMangaAnima.safetensors'
 TURBO_LORA_REPO = 'circlestone-labs/Anima-Official-LoRAs'
 TURBO_LORA_FILE = 'anima-turbo-lora-v0.2.safetensors'
-HF_TOKEN = os.getenv('HF_TOKEN', '')
+HF_TOKEN = {repr(hf_token_val)} or os.getenv('HF_TOKEN', '')
 
 if HF_TOKEN:
     os.environ['HF_TOKEN'] = HF_TOKEN
@@ -173,7 +260,7 @@ STAGE = ['starting']
 
 def _open_log():
     f = open(DEBUG_LOG, 'a', buffering=1)
-    f.write('=== session %s ===\n' % time.strftime('%Y-%m-%d %H:%M:%S'))
+    f.write('=== session %s ===\\n' % time.strftime('%Y-%m-%d %H:%M:%S'))
     return f
 
 
@@ -183,7 +270,7 @@ _LOG = _open_log()
 def mark(stage):
     line = '[%7.1fs] %s' % (time.time() - T0, stage)
     print(line, flush=True)
-    _LOG.write(line + '\n')
+    _LOG.write(line + '\\n')
     _LOG.flush()
 
 
@@ -193,12 +280,12 @@ BLOBS = REPO_CACHE / 'blobs'
 
 def repo_files():
     if LOCAL_MODEL:
-        return {}
+        return {{}}
     url = 'https://huggingface.co/api/models/%s?blobs=true' % MODEL_ID
     with urllib.request.urlopen(url, timeout=30) as r:
         data = json.loads(r.read().decode())
-    skip = {'README.md', 'LICENSE.md', '.gitattributes'}
-    return {s['rfilename']: (s.get('size') or 0) for s in data.get('siblings', []) if s['rfilename'] not in skip}
+    skip = {{'README.md', 'LICENSE.md', '.gitattributes'}}
+    return {{s['rfilename']: (s.get('size') or 0) for s in data.get('siblings', []) if s['rfilename'] not in skip}}
 
 
 def preflight(files):
@@ -206,8 +293,8 @@ def preflight(files):
         return files
     big = max(files, key=lambda k: files[k])
     url = 'https://huggingface.co/%s/resolve/main/%s' % (MODEL_ID, big)
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0',
-                                               'Range': 'bytes=0-%d' % (8 * 1024 * 1024 - 1)})
+    req = urllib.request.Request(url, headers={{'User-Agent': 'Mozilla/5.0',
+                                               'Range': 'bytes=0-%d' % (8 * 1024 * 1024 - 1)}})
     t0 = time.time()
     got = 0
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -299,6 +386,73 @@ def download_file_safe(filename, size, repo=MODEL_ID, max_retries=4):
     return False
 
 
+def auto_cache_to_kaggle_datasets():
+    """Background task: Uploads downloaded model & LoRAs directly to Kaggle Datasets for 0-second boot on future runs."""
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        u = getattr(api, "config_values", {{}}).get("username")
+        if not u:
+            return
+
+        user_datasets = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=u)]
+
+        # 1. Cache Anima Base model
+        model_slug = f"{{u}}/models-manga-coloring"
+        if not any("models-manga-coloring" in d.lower() for d in user_datasets):
+            mark('[Cloud-Cache] Packaging Anima Base model into private Kaggle dataset (%s)...' % model_slug)
+            snaps = REPO_CACHE / 'snapshots'
+            if snaps.is_dir():
+                latest_snap = next(iter(snaps.iterdir()), None)
+                if latest_snap and latest_snap.is_dir():
+                    meta = {{
+                        "title": "Models_Manga_Coloring",
+                        "id": model_slug,
+                        "licenses": [{{"name": "CC0-1.0"}}]
+                    }}
+                    with open(latest_snap / 'dataset-metadata.json', 'w', encoding='utf-8') as f:
+                        json.dump(meta, f, indent=2)
+
+                    api.dataset_create_new(
+                        str(latest_snap),
+                        dir_mode="zip",
+                        public=False,
+                        quiet=False
+                    )
+                    mark('[Cloud-Cache] Successfully created %s on Kaggle! Future runs will boot in 0 seconds.' % model_slug)
+
+        # 2. Cache LoRAs
+        lora_slug = f"{{u}}/loras-manga-coloring-anima"
+        if not any("loras-manga-coloring-anima" in d.lower() for d in user_datasets):
+            lora_staging = Path('/kaggle/working/loras_staging')
+            lora_staging.mkdir(parents=True, exist_ok=True)
+            import shutil
+            for p in Path(os.environ['HF_HOME']).rglob('*.safetensors'):
+                shutil.copy2(p, lora_staging / p.name)
+
+            lora_files = list(lora_staging.glob('*.safetensors'))
+            if lora_files:
+                mark('[Cloud-Cache] Packaging LoRAs into private Kaggle dataset (%s)...' % lora_slug)
+                meta = {{
+                    "title": "Loras_Manga_Coloring_Anima",
+                    "id": lora_slug,
+                    "licenses": [{{"name": "CC0-1.0"}}]
+                }}
+                with open(lora_staging / 'dataset-metadata.json', 'w', encoding='utf-8') as f:
+                    json.dump(meta, f, indent=2)
+
+                api.dataset_create_new(
+                    str(lora_staging),
+                    dir_mode="zip",
+                    public=False,
+                    quiet=False
+                )
+                mark('[Cloud-Cache] Successfully created %s on Kaggle! Future runs will mount LoRAs in 0 seconds.' % lora_slug)
+    except Exception as cache_err:
+        mark('[Cloud-Cache Note] %s' % cache_err)
+
+
 def warm_cache():
     if LOCAL_MODEL:
         mark('Zero-wait boot: Model detected locally at %s! Skipping 5.6GB HF download.' % LOCAL_MODEL)
@@ -333,9 +487,12 @@ def warm_cache():
         download_file_safe(TURBO_LORA_FILE, 100 * 1024 * 1024, repo=TURBO_LORA_REPO)
     mark('Model & LoRA environment ready!')
 
+    if not LOCAL_MODEL:
+        threading.Thread(target=auto_cache_to_kaggle_datasets, daemon=True).start()
+
 
 warm_cache()
-"""
+'''
     cells.append({
         "cell_type": "code",
         "execution_count": None,
@@ -961,67 +1118,6 @@ print("All outputs packaged into /kaggle/working/generated.zip! Ready for fast s
         "outputs": [],
         "source": [line + "\n" for line in cell4_lines.splitlines()]
     })
-
-    # Determine active Kaggle username
-    kuser = None
-    try:
-        from kaggle.api.kaggle_api_extended import KaggleApi
-        api = KaggleApi()
-        api.authenticate()
-        if hasattr(api, "config_values") and api.config_values.get("username"):
-            kuser = api.config_values["username"]
-        elif api.get_config_value("username"):
-            kuser = api.get_config_value("username")
-    except Exception:
-        pass
-
-    if not kuser or kuser == "your_kaggle_username":
-        u = os.getenv("KAGGLE_USERNAME")
-        if u and u != "your_kaggle_username":
-            kuser = u
-
-    if not kuser:
-        try:
-            kjson = Path.home() / ".kaggle" / "kaggle.json"
-            if kjson.exists():
-                kdata = json.loads(kjson.read_text(encoding="utf-8"))
-                if kdata.get("username"):
-                    kuser = kdata["username"]
-        except Exception:
-            pass
-
-    if not kuser:
-        kuser = "mobasharulislam"
-
-    # Resolve dataset IDs
-    # 1. Scans dataset is user-specific
-    scan_dataset_id = f"{kuser}/gbd-ch-107-part2"
-    
-    data_sources = [
-        {
-            "datasetId": scan_dataset_id,
-            "sourceType": "dataset"
-        }
-    ]
-    dataset_sources_list = [scan_dataset_id]
-
-    try:
-        from kaggle.api.kaggle_api_extended import KaggleApi
-        api = KaggleApi()
-        api.authenticate()
-        user_ds = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=kuser)]
-        
-        if any("models-manga-coloring" in d.lower() for d in user_ds):
-            user_model_id = f"{kuser}/models-manga-coloring"
-            data_sources.append({"datasetId": user_model_id, "sourceType": "dataset"})
-            dataset_sources_list.append(user_model_id)
-            
-        if any("loras-manga-coloring-anima" in d.lower() for d in user_ds):
-            user_lora_id = f"{kuser}/loras-manga-coloring-anima"
-            data_sources.append({"datasetId": user_lora_id, "sourceType": "dataset"})
-            dataset_sources_list.append(user_lora_id)
-    except Exception:
-        pass
 
     nb = {
         "cells": cells,
