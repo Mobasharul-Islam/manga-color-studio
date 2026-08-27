@@ -11,6 +11,7 @@ import time
 import shutil
 import argparse
 from pathlib import Path
+from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 
 # Base directories
@@ -41,8 +42,35 @@ def get_kaggle_api():
     return api
 
 
-def check_dataset_status(username: str = "mobasharulislam"):
+def get_current_kaggle_username() -> str:
+    """Dynamically resolves the active Kaggle username."""
+    try:
+        api = get_kaggle_api()
+        if hasattr(api, "config_values") and api.config_values.get("username"):
+            return api.config_values["username"]
+        val = api.get_config_value("username")
+        if val:
+            return val
+    except Exception:
+        pass
+    u = os.getenv("KAGGLE_USERNAME")
+    if u and u != "your_kaggle_username":
+        return u
+    try:
+        kjson = Path.home() / ".kaggle" / "kaggle.json"
+        if kjson.exists():
+            data = json.loads(kjson.read_text(encoding="utf-8"))
+            if data.get("username"):
+                return data["username"]
+    except Exception:
+        pass
+    return "mobasharulislam"
+
+
+def check_dataset_status(username: Optional[str] = None):
     """Checks whether the datasets exist on Kaggle and returns their status."""
+    if not username:
+        username = get_current_kaggle_username()
     api = get_kaggle_api()
     status = {
         "models": {
@@ -137,8 +165,10 @@ def prepare_local_loras():
     return lora_files
 
 
-def sync_loras_dataset(username: str = "mobasharulislam"):
+def sync_loras_dataset(username: Optional[str] = None):
     """Syncs the Loras_Manga_Coloring_Anima dataset to Kaggle."""
+    if not username:
+        username = get_current_kaggle_username()
     api = get_kaggle_api()
     prepare_local_loras()
 
@@ -188,8 +218,10 @@ def prepare_local_models():
     return snapshot_dir
 
 
-def sync_models_dataset(username: str = "mobasharulislam"):
+def sync_models_dataset(username: Optional[str] = None):
     """Syncs the Models_Manga_Coloring dataset to Kaggle."""
+    if not username:
+        username = get_current_kaggle_username()
     api = get_kaggle_api()
     prepare_local_models()
 

@@ -11,8 +11,12 @@ ENV/
 
 # Secrets, Environment & API Keys
 .env
+.env.*
 kaggle.json
 kaggle_token.txt
+access_token
+access_token.txt
+token
 *.pem
 *.key
 
@@ -33,6 +37,7 @@ loras/*.safetensors
 # Generated Notebook Output & Logs
 kernel_anima/
 output_*/
+debug_kernel_output/
 *.log
 kaggle_execution.log
 

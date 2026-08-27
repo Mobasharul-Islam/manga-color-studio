@@ -142,12 +142,14 @@ from safetensors.torch import load_file
 
 faulthandler.enable()
 
-MODEL_CANDIDATE_DIRS = [
-    '/kaggle/input/models-manga-coloring',
-    '/kaggle/input/Models_Manga_Coloring',
-    '/kaggle/input/datasets/mobasharulislam/models-manga-coloring',
-]
-LOCAL_MODEL = next((p for p in MODEL_CANDIDATE_DIRS if os.path.isdir(p)), None)
+def find_local_model():
+    if os.path.exists('/kaggle/input'):
+        for root, dirs, files in os.walk('/kaggle/input'):
+            if 'model_index.json' in files:
+                return root
+    return None
+
+LOCAL_MODEL = find_local_model()
 MODEL_ID = LOCAL_MODEL if LOCAL_MODEL else 'circlestone-labs/Anima-Base-v1.0-Diffusers'
 MANGA_LORA_REPO = 'Kutches/Anim4'
 MANGA_LORA_FILE = 'colorMangaAnima.safetensors'
@@ -317,13 +319,13 @@ def warm_cache():
                 download_file_safe(f, files[f])
 
     mark('pre-caching LoRAs if needed...')
-    # Check if LoRAs are in mounted dataset
-    lora_ds_cand = [
-        '/kaggle/input/loras-manga-coloring-anima',
-        '/kaggle/input/Loras_Manga_Coloring_Anima',
-        '/kaggle/input/datasets/mobasharulislam/loras-manga-coloring-anima'
-    ]
-    ds_has_loras = any(os.path.isdir(d) and os.path.exists(os.path.join(d, MANGA_LORA_FILE)) for d in lora_ds_cand)
+    # Check if LoRAs are in any mounted dataset
+    ds_has_loras = False
+    if os.path.exists('/kaggle/input'):
+        for root, dirs, files in os.walk('/kaggle/input'):
+            if MANGA_LORA_FILE in files:
+                ds_has_loras = True
+                break
     if ds_has_loras:
         mark('Zero-wait boot: LoRAs mounted in dataset! Skipping LoRA download.')
     else:
@@ -363,12 +365,14 @@ from diffusers import ModularPipeline
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
-MODEL_CANDIDATE_DIRS = [
-    '/kaggle/input/models-manga-coloring',
-    '/kaggle/input/Models_Manga_Coloring',
-    '/kaggle/input/datasets/mobasharulislam/models-manga-coloring',
-]
-LOCAL_MODEL = next((p for p in MODEL_CANDIDATE_DIRS if os.path.isdir(p)), None)
+def find_local_model():
+    if os.path.exists('/kaggle/input'):
+        for root, dirs, files in os.walk('/kaggle/input'):
+            if 'model_index.json' in files:
+                return root
+    return None
+
+LOCAL_MODEL = find_local_model()
 MODEL_ID = LOCAL_MODEL if LOCAL_MODEL else 'circlestone-labs/Anima-Base-v1.0-Diffusers'
 MANGA_LORA_REPO = 'Kutches/Anim4'
 MANGA_LORA_FILE = 'colorMangaAnima.safetensors'
@@ -500,16 +504,12 @@ def resolve_lora_path(lora_path_str):
     if '?' in filename:
         filename = filename.split('?')[0]
 
-    # 1. Check mounted Kaggle datasets & local folders
-    lora_candidate_dirs = [
-        '/kaggle/input/loras-manga-coloring-anima',
-        '/kaggle/input/Loras_Manga_Coloring_Anima',
-        '/kaggle/input/datasets/mobasharulislam/loras-manga-coloring-anima',
-        '/kaggle/input/gbd-ch-107-part2',
-        '/kaggle/working/loras',
-        '/kaggle/working'
-    ]
-    for d in lora_candidate_dirs:
+    # 1. Check mounted Kaggle datasets & local working folders
+    if os.path.exists('/kaggle/input'):
+        for root, dirs, files in os.walk('/kaggle/input'):
+            if filename in files:
+                return os.path.join(root, filename)
+    for d in ['/kaggle/working/loras', '/kaggle/working']:
         cand = os.path.join(d, filename)
         if os.path.isfile(cand):
             return cand
@@ -767,50 +767,60 @@ from PIL import Image
 import torch_xla.distributed.xla_multiprocessing as xmp
 from tpu_worker import mp_worker, add_lora
 
-DATASET_DIR_CANDIDATES = [
-    '/kaggle/working/input_pages',
-    '/kaggle/input/datasets/mobasharulislam/gbd-ch-107-part2',
-    '/kaggle/input/gbd-ch-107-part2',
-]
-
 # ----------------------------------------------------
-# Auto-Unzip: Check for any scan zip archives and extract to /kaggle/working/input_pages
+# Auto-Unzip: Check for scan zip archives across all mounted datasets in /kaggle/input
 # ----------------------------------------------------
 import zipfile
 
 UNZIP_DIR = '/kaggle/working/input_pages'
 os.makedirs(UNZIP_DIR, exist_ok=True)
 
-for candidate in DATASET_DIR_CANDIDATES:
-    if os.path.isdir(candidate) and candidate != UNZIP_DIR:
-        zips = glob.glob(os.path.join(candidate, '*.zip')) + glob.glob(os.path.join(candidate, '**/*.zip'), recursive=True)
-        for zf_path in zips:
-            print(f"[Auto-Unzip] Found scan archive '{os.path.basename(zf_path)}' in {candidate}. Extracting to {UNZIP_DIR}...", flush=True)
-            try:
-                with zipfile.ZipFile(zf_path, 'r') as zip_ref:
-                    zip_ref.extractall(UNZIP_DIR)
-                print(f"[Auto-Unzip] Successfully extracted '{os.path.basename(zf_path)}'!", flush=True)
-            except Exception as ze:
-                print(f"[Auto-Unzip Warning] Failed to extract {zf_path}: {ze}", flush=True)
+if os.path.exists('/kaggle/input'):
+    for root, dirs, files in os.walk('/kaggle/input'):
+        for zf in files:
+            if zf.lower().endswith('.zip'):
+                if 'model' in zf.lower():
+                    continue
+                zf_path = os.path.join(root, zf)
+                print(f"[Auto-Unzip] Found scan archive '{zf}' at '{zf_path}'. Extracting to {UNZIP_DIR}...", flush=True)
+                try:
+                    with zipfile.ZipFile(zf_path, 'r') as zip_ref:
+                        zip_ref.extractall(UNZIP_DIR)
+                    print(f"[Auto-Unzip] Successfully extracted '{zf}'!", flush=True)
+                except Exception as ze:
+                    print(f"[Auto-Unzip Warning] Failed to extract {zf_path}: {ze}", flush=True)
 
 IMAGE_PATHS = []
-for candidate in DATASET_DIR_CANDIDATES:
-    if os.path.isdir(candidate):
-        imgs = (
-            glob.glob(os.path.join(candidate, '*.jpg'))
-            + glob.glob(os.path.join(candidate, '*.jpeg'))
-            + glob.glob(os.path.join(candidate, '*.png'))
-            + glob.glob(os.path.join(candidate, '*.webp'))
-            + glob.glob(os.path.join(candidate, '*.bmp'))
-        )
-        if imgs:
-            DATASET_DIR = candidate
-            IMAGE_PATHS = sorted(imgs)
-            break
+image_exts = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
+
+# 1. Check UNZIP_DIR first
+for root, dirs, files in os.walk(UNZIP_DIR):
+    for f in sorted(files):
+        if f.lower().endswith(image_exts) and not f.startswith('.'):
+            IMAGE_PATHS.append(os.path.join(root, f))
+
+# 2. Check all /kaggle/input (excluding model/lora folders) if UNZIP_DIR had no images
+if not IMAGE_PATHS and os.path.exists('/kaggle/input'):
+    for root, dirs, files in os.walk('/kaggle/input'):
+        lower_root = root.lower()
+        if 'model' in lower_root or 'lora' in lower_root:
+            continue
+        for f in sorted(files):
+            if f.lower().endswith(image_exts) and not f.startswith('.'):
+                IMAGE_PATHS.append(os.path.join(root, f))
 
 if not IMAGE_PATHS:
-    raise FileNotFoundError('no images found in any candidate dir: %s' % DATASET_DIR_CANDIDATES)
+    print("[Diagnostic] Full directory tree of /kaggle/input:", flush=True)
+    if os.path.exists('/kaggle/input'):
+        for root, dirs, files in os.walk('/kaggle/input'):
+            print(f"  {root} -> {files}", flush=True)
+    else:
+        print("  /kaggle/input does not exist!", flush=True)
+    print(f"[Diagnostic] Files in /kaggle/working: {os.listdir('/kaggle/working')}", flush=True)
+    raise FileNotFoundError('No manga scans found in /kaggle/input or /kaggle/working/input_pages!')
 
+IMAGE_PATHS = sorted(IMAGE_PATHS)
+DATASET_DIR = os.path.dirname(IMAGE_PATHS[0])
 print('Dataset selected: %s (%d raw images found)' % (DATASET_DIR, len(IMAGE_PATHS)), flush=True)
 
 # ----------------------------------------------------
@@ -952,13 +962,64 @@ print("All outputs packaged into /kaggle/working/generated.zip! Ready for fast s
         "source": [line + "\n" for line in cell4_lines.splitlines()]
     })
 
-    kuser = os.getenv("KAGGLE_USERNAME", "mobasharulislam")
+    # Determine active Kaggle username
+    kuser = None
     try:
-        kjson = Path.home() / ".kaggle" / "kaggle.json"
-        if kjson.exists():
-            kdata = json.loads(kjson.read_text(encoding="utf-8"))
-            if kdata.get("username"):
-                kuser = kdata["username"]
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        if hasattr(api, "config_values") and api.config_values.get("username"):
+            kuser = api.config_values["username"]
+        elif api.get_config_value("username"):
+            kuser = api.get_config_value("username")
+    except Exception:
+        pass
+
+    if not kuser or kuser == "your_kaggle_username":
+        u = os.getenv("KAGGLE_USERNAME")
+        if u and u != "your_kaggle_username":
+            kuser = u
+
+    if not kuser:
+        try:
+            kjson = Path.home() / ".kaggle" / "kaggle.json"
+            if kjson.exists():
+                kdata = json.loads(kjson.read_text(encoding="utf-8"))
+                if kdata.get("username"):
+                    kuser = kdata["username"]
+        except Exception:
+            pass
+
+    if not kuser:
+        kuser = "mobasharulislam"
+
+    # Resolve dataset IDs
+    # 1. Scans dataset is user-specific
+    scan_dataset_id = f"{kuser}/gbd-ch-107-part2"
+    
+    data_sources = [
+        {
+            "datasetId": scan_dataset_id,
+            "sourceType": "dataset"
+        }
+    ]
+    dataset_sources_list = [scan_dataset_id]
+
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        user_ds = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=kuser)]
+        
+        if any("models-manga-coloring" in d.lower() for d in user_ds):
+            user_model_id = f"{kuser}/models-manga-coloring"
+            data_sources.append({"datasetId": user_model_id, "sourceType": "dataset"})
+            dataset_sources_list.append(user_model_id)
+            
+        if any("loras-manga-coloring-anima" in d.lower() for d in user_ds):
+            user_lora_id = f"{kuser}/loras-manga-coloring-anima"
+            data_sources.append({"datasetId": user_lora_id, "sourceType": "dataset"})
+            dataset_sources_list.append(user_lora_id)
     except Exception:
         pass
 
@@ -967,20 +1028,7 @@ print("All outputs packaged into /kaggle/working/generated.zip! Ready for fast s
         "metadata": {
             "kaggle": {
                 "accelerator": "tpuV3-8",
-                "dataSources": [
-                    {
-                        "datasetId": f"{kuser}/gbd-ch-107-part2",
-                        "sourceType": "dataset"
-                    },
-                    {
-                        "datasetId": f"{kuser}/models-manga-coloring",
-                        "sourceType": "dataset"
-                    },
-                    {
-                        "datasetId": f"{kuser}/loras-manga-coloring-anima",
-                        "sourceType": "dataset"
-                    }
-                ],
+                "dataSources": data_sources,
                 "dockerImageVersionId": 30787,
                 "isGpuEnabled": False,
                 "isInternetEnabled": True,
@@ -1023,11 +1071,7 @@ print("All outputs packaged into /kaggle/working/generated.zip! Ready for fast s
         "enable_gpu": "false",
         "enable_tpu": "true",
         "enable_internet": "true",
-        "dataset_sources": [
-            f"{kuser}/gbd-ch-107-part2",
-            f"{kuser}/models-manga-coloring",
-            f"{kuser}/loras-manga-coloring-anima"
-        ],
+        "dataset_sources": dataset_sources_list,
         "kernel_sources": []
     }
     (out_file.parent / "kernel-metadata.json").write_text(json.dumps(kernel_meta, indent=1), encoding="utf-8")

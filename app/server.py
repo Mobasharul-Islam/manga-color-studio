@@ -787,7 +787,8 @@ def update_lora_endpoint(req: UpdateLoraRequest):
 async def get_datasets_status_endpoint():
     """Checks the status of Models_Manga_Coloring and Loras_Manga_Coloring_Anima on Kaggle."""
     from scripts.sync_kaggle_datasets import check_dataset_status
-    status = await asyncio.to_thread(check_dataset_status)
+    u = get_kaggle_username()
+    status = await asyncio.to_thread(check_dataset_status, u)
     return status
 
 
@@ -795,11 +796,12 @@ async def get_datasets_status_endpoint():
 def sync_loras_endpoint(background_tasks: BackgroundTasks):
     """Synchronizes all local LoRAs to Kaggle dataset in background."""
     from scripts.sync_kaggle_datasets import sync_loras_dataset
+    u = get_kaggle_username()
 
     def _sync_worker():
-        log_message("Starting Kaggle LoRAs dataset sync (Loras_Manga_Coloring_Anima)...")
+        log_message(f"Starting Kaggle LoRAs dataset sync (Loras_Manga_Coloring_Anima) for @{u}...")
         try:
-            sync_loras_dataset()
+            sync_loras_dataset(u)
             log_message("Kaggle LoRAs dataset synchronized successfully!")
         except Exception as e:
             log_message(f"LoRA dataset sync error: {e}")
@@ -812,11 +814,12 @@ def sync_loras_endpoint(background_tasks: BackgroundTasks):
 def sync_models_endpoint(background_tasks: BackgroundTasks):
     """Synchronizes Anima Base model to Kaggle dataset in background."""
     from scripts.sync_kaggle_datasets import sync_models_dataset
+    u = get_kaggle_username()
 
     def _sync_worker():
-        log_message("Starting Kaggle Model dataset sync (Models_Manga_Coloring)...")
+        log_message(f"Starting Kaggle Model dataset sync (Models_Manga_Coloring) for @{u}...")
         try:
-            sync_models_dataset()
+            sync_models_dataset(u)
             log_message("Kaggle Model dataset synchronized successfully!")
         except Exception as e:
             log_message(f"Model dataset sync error: {e}")
@@ -831,12 +834,15 @@ class SaveSettingsRequest(BaseModel):
     hf_token: Optional[str] = None
 
 
-def get_kaggle_api_safe():
+def get_kaggle_api_safe(verify_online: bool = False):
     """Lazily imports and tests KaggleApi without raising unhandled errors."""
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
         api = KaggleApi()
         api.authenticate()
+        if verify_online:
+            u = getattr(api, "config_values", {}).get("username") or os.getenv("KAGGLE_USERNAME")
+            api.dataset_list(user=u)
         return api
     except Exception:
         return None
@@ -844,9 +850,21 @@ def get_kaggle_api_safe():
 
 def get_kaggle_username() -> str:
     """Dynamically resolves the authenticated Kaggle username."""
+    api = get_kaggle_api_safe()
+    if api:
+        if hasattr(api, "config_values") and api.config_values.get("username"):
+            return api.config_values["username"]
+        try:
+            val = api.get_config_value("username")
+            if val:
+                return val
+        except Exception:
+            pass
+
     u = os.getenv("KAGGLE_USERNAME")
     if u and u != "your_kaggle_username":
         return u
+
     try:
         kjson = Path.home() / ".kaggle" / "kaggle.json"
         if kjson.exists():
@@ -855,11 +873,7 @@ def get_kaggle_username() -> str:
                 return data["username"]
     except Exception:
         pass
-    
-    api = get_kaggle_api_safe()
-    if api and hasattr(api, "config_values") and api.config_values.get("username"):
-        return api.config_values["username"]
-    
+
     return "mobasharulislam"
 
 
@@ -886,14 +900,27 @@ def save_settings_endpoint(req: SaveSettingsRequest):
     kaggle_dir.mkdir(parents=True, exist_ok=True)
     kaggle_file = kaggle_dir / "kaggle.json"
 
-    if req.kaggle_username and req.kaggle_key:
+    key_or_token = req.kaggle_key.strip() if req.kaggle_key else ""
+    username = req.kaggle_username.strip() if req.kaggle_username else ""
+
+    if key_or_token:
+        # Clear legacy cached access tokens
+        (kaggle_dir / "access_token").unlink(missing_ok=True)
+        (kaggle_dir / "access_token.txt").unlink(missing_ok=True)
+        (kaggle_dir / "token").unlink(missing_ok=True)
+
+        if key_or_token.startswith("KGAT_"):
+            (kaggle_dir / "access_token").write_text(key_or_token, encoding="utf-8")
+            os.environ["KAGGLE_API_TOKEN"] = key_or_token
+        
         creds = {
-            "username": req.kaggle_username.strip(),
-            "key": req.kaggle_key.strip()
+            "username": username or "rabiulislam5788",
+            "key": key_or_token
         }
         kaggle_file.write_text(json.dumps(creds, indent=2), encoding="utf-8")
-        os.environ["KAGGLE_USERNAME"] = req.kaggle_username.strip()
-        os.environ["KAGGLE_KEY"] = req.kaggle_key.strip()
+        if username:
+            os.environ["KAGGLE_USERNAME"] = username
+        os.environ["KAGGLE_KEY"] = key_or_token
 
     if req.hf_token:
         os.environ["HF_TOKEN"] = req.hf_token.strip()
@@ -903,25 +930,29 @@ def save_settings_endpoint(req: SaveSettingsRequest):
     env_lines = []
     if env_file.exists():
         for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.startswith("KAGGLE_USERNAME=") and req.kaggle_username:
+            if line.startswith("KAGGLE_USERNAME=") and username:
                 continue
-            if line.startswith("KAGGLE_KEY=") and req.kaggle_key:
+            if line.startswith("KAGGLE_KEY=") and key_or_token:
+                continue
+            if line.startswith("KAGGLE_API_TOKEN=") and key_or_token:
                 continue
             if line.startswith("HF_TOKEN=") and req.hf_token:
                 continue
             env_lines.append(line)
     
-    if req.kaggle_username:
-        env_lines.append(f"KAGGLE_USERNAME={req.kaggle_username.strip()}")
-    if req.kaggle_key:
-        env_lines.append(f"KAGGLE_KEY={req.kaggle_key.strip()}")
+    if username:
+        env_lines.append(f"KAGGLE_USERNAME={username}")
+    if key_or_token:
+        env_lines.append(f"KAGGLE_KEY={key_or_token}")
+        if key_or_token.startswith("KGAT_"):
+            env_lines.append(f"KAGGLE_API_TOKEN={key_or_token}")
     if req.hf_token:
         env_lines.append(f"HF_TOKEN={req.hf_token.strip()}")
 
     env_file.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
 
     # Verify Kaggle authentication
-    api = get_kaggle_api_safe()
+    api = get_kaggle_api_safe(verify_online=True)
     if api:
         u = get_kaggle_username()
         log_message(f"Kaggle API authenticated successfully as @{u}")
@@ -937,7 +968,7 @@ def save_settings_endpoint(req: SaveSettingsRequest):
             "status": "warning",
             "kaggle_authenticated": False,
             "error": "Authentication failed",
-            "message": "Saved credentials, but Kaggle authentication failed. Please verify your username and API key."
+            "message": "Saved credentials, but Kaggle online authentication failed. Please verify your username and API key/token."
         }
 
 
@@ -955,16 +986,32 @@ async def upload_kaggle_json_endpoint(file: UploadFile = File(...)):
         
         kaggle_dir = Path.home() / ".kaggle"
         kaggle_dir.mkdir(parents=True, exist_ok=True)
+        (kaggle_dir / "access_token").unlink(missing_ok=True)
+        (kaggle_dir / "access_token.txt").unlink(missing_ok=True)
+        (kaggle_dir / "token").unlink(missing_ok=True)
+
         kaggle_file = kaggle_dir / "kaggle.json"
         kaggle_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
         os.environ["KAGGLE_USERNAME"] = data["username"]
         os.environ["KAGGLE_KEY"] = data["key"]
 
+        # Update .env
+        env_file = BASE_DIR / ".env"
+        env_lines = []
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                if line.startswith("KAGGLE_USERNAME=") or line.startswith("KAGGLE_KEY="):
+                    continue
+                env_lines.append(line)
+        env_lines.append(f"KAGGLE_USERNAME={data['username']}")
+        env_lines.append(f"KAGGLE_KEY={data['key']}")
+        env_file.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+
         # Verify
-        api = get_kaggle_api_safe()
+        api = get_kaggle_api_safe(verify_online=True)
         if not api:
-            raise RuntimeError("Authentication failed with the uploaded kaggle.json")
+            raise RuntimeError("Online verification failed with the uploaded kaggle.json")
         u = data["username"]
         log_message(f"Uploaded kaggle.json authenticated successfully as @{u}")
         return {
@@ -1023,9 +1070,12 @@ def background_tpu_runner(req: JobStartRequest):
                 import shutil
                 shutil.copy2(local_zips[0], zip_dest)
 
+            dataset_slug = "gbd-ch-107-part2"
+            dataset_full_slug = f"{kaggle_user}/{dataset_slug}"
+
             meta = {
-                "title": "gbd-ch-107-part2",
-                "id": f"{kaggle_user}/gbd-ch-107-part2",
+                "title": dataset_slug,
+                "id": dataset_full_slug,
                 "licenses": [{"name": "CC0-1.0"}]
             }
             with open(staging_dir / "dataset-metadata.json", "w", encoding="utf-8") as f:
@@ -1034,7 +1084,30 @@ def background_tpu_runner(req: JobStartRequest):
             api = get_kaggle_api_safe()
             if not api:
                 raise RuntimeError("Kaggle API is not authenticated. Please check your Kaggle API key in Settings.")
-            api.dataset_create_version(str(staging_dir), version_notes=f"Chapter: {req.chapter_name}", dir_mode="zip")
+
+            # Check if dataset exists on Kaggle under this user
+            existing_datasets = []
+            try:
+                existing_datasets = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=kaggle_user)]
+            except Exception as e:
+                log_message(f"Note checking existing datasets: {e}")
+
+            dataset_exists = any(dataset_full_slug.lower() == d.lower() or dataset_slug.lower() == d.split("/")[-1].lower() for d in existing_datasets)
+
+            if dataset_exists:
+                try:
+                    log_message(f"Updating existing Kaggle dataset '{dataset_full_slug}'...")
+                    api.dataset_create_version(str(staging_dir), version_notes=f"Chapter: {req.chapter_name}", dir_mode="zip")
+                except Exception as ver_err:
+                    if "403" in str(ver_err) or "404" in str(ver_err) or "not found" in str(ver_err).lower():
+                        log_message(f"Version update returned ({ver_err}). Creating new dataset '{dataset_full_slug}'...")
+                        api.dataset_create_new(str(staging_dir), dir_mode="zip", public=False, quiet=False)
+                    else:
+                        raise
+            else:
+                log_message(f"Creating new private Kaggle dataset '{dataset_full_slug}'...")
+                api.dataset_create_new(str(staging_dir), dir_mode="zip", public=False, quiet=False)
+
             log_message("Kaggle dataset upload submitted. Waiting for Kaggle backend to finish indexing...")
             with state_lock:
                 job_state["phase_message"] = "Waiting for Kaggle dataset processing..."
@@ -1134,7 +1207,7 @@ def background_tpu_runner(req: JobStartRequest):
             job_state["phase_message"] = "Downloading finished high-res color images..."
         log_message(f"Downloading outputs to {chapter_out}...")
 
-        dl_res = subprocess.run([sys_py, str(SCRIPTS_DIR / "download_fixed.py"), str(chapter_out)], capture_output=True, text=True, cwd=BASE_DIR)
+        dl_res = subprocess.run([sys_py, str(SCRIPTS_DIR / "download_fixed.py"), str(chapter_out), kaggle_user], capture_output=True, text=True, cwd=BASE_DIR)
         log_message(dl_res.stdout[-300:] if dl_res.stdout else "Downloaded successfully.")
 
         # 5. Populate Output Results

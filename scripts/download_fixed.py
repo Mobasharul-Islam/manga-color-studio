@@ -15,12 +15,37 @@ def utf8_open(*args, **kwargs):
 
 builtins.open = utf8_open
 
-from kaggle.api.kaggle_api_extended import KaggleApi
-
 api = KaggleApi()
 api.authenticate()
 
-kernel = "mobasharulislam/tpu-image-generation-anima-base-1-0-2b"
+def resolve_kaggle_user():
+    if len(sys.argv) > 2 and sys.argv[2]:
+        return sys.argv[2]
+    if hasattr(api, "config_values") and api.config_values.get("username"):
+        return api.config_values["username"]
+    try:
+        val = api.get_config_value("username")
+        if val:
+            return val
+    except Exception:
+        pass
+    u = os.getenv("KAGGLE_USERNAME")
+    if u and u != "your_kaggle_username":
+        return u
+    try:
+        import json
+        from pathlib import Path
+        kjson = Path.home() / ".kaggle" / "kaggle.json"
+        if kjson.exists():
+            data = json.loads(kjson.read_text(encoding="utf-8"))
+            if data.get("username"):
+                return data["username"]
+    except Exception:
+        pass
+    return "mobasharulislam"
+
+kaggle_user = resolve_kaggle_user()
+kernel = f"{kaggle_user}/tpu-image-generation-anima-base-1-0-2b"
 dest = sys.argv[1] if len(sys.argv) > 1 else "output_anima/out_v21"
 os.makedirs(dest, exist_ok=True)
 
