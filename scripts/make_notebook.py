@@ -394,8 +394,11 @@ def download_file_safe(filename, size, repo=MODEL_ID, max_retries=4):
     return False
 
 
+CACHE_THREAD = None
+
+
 def auto_cache_to_kaggle_datasets():
-    """Background task: Uploads downloaded model & LoRAs directly to Kaggle Datasets for 0-second boot on future runs."""
+    """Background task: Uploads downloaded LoRAs & model directly to Kaggle Datasets for 0-second boot on future runs."""
     try:
         try:
             from kaggle.api.kaggle_api_extended import KaggleApi
@@ -412,37 +415,7 @@ def auto_cache_to_kaggle_datasets():
         user_datasets = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=u)]
         import shutil
 
-        # 1. Cache Anima Base model
-        model_slug = f"{{u}}/models-manga-coloring"
-        if not any("models-manga-coloring" in d.lower() for d in user_datasets):
-            snaps = REPO_CACHE / 'snapshots'
-            if snaps.is_dir():
-                latest_snap = next(iter(snaps.iterdir()), None)
-                if latest_snap and latest_snap.is_dir():
-                    mark('[Cloud-Cache] Packaging Anima Base model into private Kaggle dataset (%s)...' % model_slug)
-                    model_staging = Path('/kaggle/working/model_staging')
-                    if model_staging.exists():
-                        shutil.rmtree(model_staging, ignore_errors=True)
-                    shutil.copytree(latest_snap, model_staging, symlinks=False)
-
-                    meta = {{
-                        "title": "Models_Manga_Coloring",
-                        "id": model_slug,
-                        "licenses": [{{"name": "CC0-1.0"}}]
-                    }}
-                    with open(model_staging / 'dataset-metadata.json', 'w', encoding='utf-8') as f:
-                        json.dump(meta, f, indent=2)
-
-                    api.dataset_create_new(
-                        str(model_staging),
-                        dir_mode="zip",
-                        public=False,
-                        quiet=False
-                    )
-                    shutil.rmtree(model_staging, ignore_errors=True)
-                    mark('[Cloud-Cache] Successfully created %s on Kaggle! Future runs will boot in 0 seconds.' % model_slug)
-
-        # 2. Cache LoRAs
+        # 1. Cache LoRAs FIRST (Fast ~150MB, takes <10s)
         lora_slug = f"{{u}}/loras-manga-coloring-anima"
         if not any("loras-manga-coloring-anima" in d.lower() for d in user_datasets):
             lora_staging = Path('/kaggle/working/loras_staging')
@@ -472,11 +445,42 @@ def auto_cache_to_kaggle_datasets():
                 )
                 shutil.rmtree(lora_staging, ignore_errors=True)
                 mark('[Cloud-Cache] Successfully created %s on Kaggle! Future runs will mount LoRAs in 0 seconds.' % lora_slug)
+
+        # 2. Cache Anima Base model (5.6GB)
+        model_slug = f"{{u}}/models-manga-coloring"
+        if not any("models-manga-coloring" in d.lower() for d in user_datasets):
+            snaps = REPO_CACHE / 'snapshots'
+            if snaps.is_dir():
+                latest_snap = next(iter(snaps.iterdir()), None)
+                if latest_snap and latest_snap.is_dir():
+                    mark('[Cloud-Cache] Packaging Anima Base model into private Kaggle dataset (%s)...' % model_slug)
+                    model_staging = Path('/kaggle/working/model_staging')
+                    if model_staging.exists():
+                        shutil.rmtree(model_staging, ignore_errors=True)
+                    shutil.copytree(latest_snap, model_staging, symlinks=False)
+
+                    meta = {{
+                        "title": "Models_Manga_Coloring",
+                        "id": model_slug,
+                        "licenses": [{{"name": "CC0-1.0"}}]
+                    }}
+                    with open(model_staging / 'dataset-metadata.json', 'w', encoding='utf-8') as f:
+                        json.dump(meta, f, indent=2)
+
+                    api.dataset_create_new(
+                        str(model_staging),
+                        dir_mode="zip",
+                        public=False,
+                        quiet=False
+                    )
+                    shutil.rmtree(model_staging, ignore_errors=True)
+                    mark('[Cloud-Cache] Successfully created %s on Kaggle! Future runs will boot in 0 seconds.' % model_slug)
     except Exception as cache_err:
         mark('[Cloud-Cache Note] %s' % cache_err)
 
 
 def warm_cache():
+    global CACHE_THREAD
     if LOCAL_MODEL:
         mark('Zero-wait boot: Model detected locally at %s! Skipping 5.6GB HF download.' % LOCAL_MODEL)
     else:
@@ -510,8 +514,9 @@ def warm_cache():
         download_file_safe(TURBO_LORA_FILE, 100 * 1024 * 1024, repo=TURBO_LORA_REPO)
     mark('Model & LoRA environment ready!')
 
-    if not LOCAL_MODEL:
-        threading.Thread(target=auto_cache_to_kaggle_datasets, daemon=True).start()
+    if not LOCAL_MODEL or not ds_has_loras:
+        CACHE_THREAD = threading.Thread(target=auto_cache_to_kaggle_datasets, daemon=False)
+        CACHE_THREAD.start()
 
 
 warm_cache()
@@ -1131,6 +1136,17 @@ for temp_path in ['/kaggle/working/split_pages', '/kaggle/working/input_pages', 
             pass
 
 print("All outputs packaged into /kaggle/working/generated.zip! Ready for fast single-archive download.", flush=True)
+
+# ----------------------------------------------------
+# Finalize cloud dataset auto-caching if upload is still in progress
+# ----------------------------------------------------
+try:
+    if 'CACHE_THREAD' in globals() and CACHE_THREAD is not None and CACHE_THREAD.is_alive():
+        print("[Cloud-Cache] Waiting for background dataset caching to finalize upload...", flush=True)
+        CACHE_THREAD.join(timeout=600)
+        print("[Cloud-Cache] Background dataset caching completed or finalized.", flush=True)
+except Exception as _cache_e:
+    print("[Cloud-Cache Note] %s" % _cache_e, flush=True)
 """
     cell4_lines = cell4_template.replace("__WORKER_CODE_INJECT__", repr(worker_code_str))
 
