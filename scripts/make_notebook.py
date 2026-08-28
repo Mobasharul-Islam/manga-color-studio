@@ -50,7 +50,7 @@ def build_notebook(
         "metadata": {},
         "outputs": [],
         "source": [
-            "!pip uninstall -y -q google-tunix 2>/dev/null; pip install -q --upgrade \"transformers==5.15.0\" \"tokenizers==0.22.2\" accelerate safetensors peft\n",
+            "!pip uninstall -y -q google-tunix 2>/dev/null; pip install -q --upgrade \"transformers==5.15.0\" \"tokenizers==0.22.2\" accelerate safetensors peft kaggle\n",
             "!pip install --upgrade \"huggingface_hub @ git+https://github.com/huggingface/huggingface_hub.git@f34cd32cac1f3603e3294543e1fb0eb4508d5139\" \"diffusers @ git+https://github.com/huggingface/diffusers.git@102c24934fe1705e6caaadb03789b0f2542fd8a9\"\n",
         ]
     })
@@ -220,10 +220,18 @@ try:
     kdir.mkdir(parents=True, exist_ok=True)
     if {repr(ktoken)}:
         (kdir / 'access_token').write_text({repr(ktoken)}, encoding='utf-8')
+        try:
+            os.chmod(str(kdir / 'access_token'), 0o600)
+        except Exception:
+            pass
         os.environ['KAGGLE_API_TOKEN'] = {repr(ktoken)}
     if {repr(kuser)} and {repr(kkey)}:
         kjson = {{"username": {repr(kuser)}, "key": {repr(kkey)}}}
         (kdir / 'kaggle.json').write_text(json.dumps(kjson, indent=2), encoding='utf-8')
+        try:
+            os.chmod(str(kdir / 'kaggle.json'), 0o600)
+        except Exception:
+            pass
         os.environ['KAGGLE_USERNAME'] = {repr(kuser)}
         os.environ['KAGGLE_KEY'] = {repr(kkey)}
 except Exception:
@@ -389,45 +397,59 @@ def download_file_safe(filename, size, repo=MODEL_ID, max_retries=4):
 def auto_cache_to_kaggle_datasets():
     """Background task: Uploads downloaded model & LoRAs directly to Kaggle Datasets for 0-second boot on future runs."""
     try:
-        from kaggle.api.kaggle_api_extended import KaggleApi
+        try:
+            from kaggle.api.kaggle_api_extended import KaggleApi
+        except ImportError:
+            subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'kaggle'], check=False)
+            from kaggle.api.kaggle_api_extended import KaggleApi
+
         api = KaggleApi()
         api.authenticate()
-        u = getattr(api, "config_values", {{}}).get("username")
+        u = getattr(api, "config_values", {{}}).get("username") or getattr(api, "_config_values", {{}}).get("username") or os.getenv("KAGGLE_USERNAME") or {repr(kuser)}
         if not u:
             return
 
         user_datasets = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=u)]
+        import shutil
 
         # 1. Cache Anima Base model
         model_slug = f"{{u}}/models-manga-coloring"
         if not any("models-manga-coloring" in d.lower() for d in user_datasets):
-            mark('[Cloud-Cache] Packaging Anima Base model into private Kaggle dataset (%s)...' % model_slug)
             snaps = REPO_CACHE / 'snapshots'
             if snaps.is_dir():
                 latest_snap = next(iter(snaps.iterdir()), None)
                 if latest_snap and latest_snap.is_dir():
+                    mark('[Cloud-Cache] Packaging Anima Base model into private Kaggle dataset (%s)...' % model_slug)
+                    model_staging = Path('/kaggle/working/model_staging')
+                    if model_staging.exists():
+                        shutil.rmtree(model_staging, ignore_errors=True)
+                    shutil.copytree(latest_snap, model_staging, symlinks=False)
+
                     meta = {{
                         "title": "Models_Manga_Coloring",
                         "id": model_slug,
                         "licenses": [{{"name": "CC0-1.0"}}]
                     }}
-                    with open(latest_snap / 'dataset-metadata.json', 'w', encoding='utf-8') as f:
+                    with open(model_staging / 'dataset-metadata.json', 'w', encoding='utf-8') as f:
                         json.dump(meta, f, indent=2)
 
                     api.dataset_create_new(
-                        str(latest_snap),
+                        str(model_staging),
                         dir_mode="zip",
                         public=False,
                         quiet=False
                     )
+                    shutil.rmtree(model_staging, ignore_errors=True)
                     mark('[Cloud-Cache] Successfully created %s on Kaggle! Future runs will boot in 0 seconds.' % model_slug)
 
         # 2. Cache LoRAs
         lora_slug = f"{{u}}/loras-manga-coloring-anima"
         if not any("loras-manga-coloring-anima" in d.lower() for d in user_datasets):
             lora_staging = Path('/kaggle/working/loras_staging')
+            if lora_staging.exists():
+                shutil.rmtree(lora_staging, ignore_errors=True)
             lora_staging.mkdir(parents=True, exist_ok=True)
-            import shutil
+
             for p in Path(os.environ['HF_HOME']).rglob('*.safetensors'):
                 shutil.copy2(p, lora_staging / p.name)
 
@@ -448,6 +470,7 @@ def auto_cache_to_kaggle_datasets():
                     public=False,
                     quiet=False
                 )
+                shutil.rmtree(lora_staging, ignore_errors=True)
                 mark('[Cloud-Cache] Successfully created %s on Kaggle! Future runs will mount LoRAs in 0 seconds.' % lora_slug)
     except Exception as cache_err:
         mark('[Cloud-Cache Note] %s' % cache_err)
