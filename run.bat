@@ -40,13 +40,23 @@ if not exist ".venv\Scripts\python.exe" (
         pause
         exit /b 1
     )
+    copy /y requirements.txt ".venv\requirements.installed" >nul
 )
 
-:: 3. Check if core dependencies are present in .venv
-".venv\Scripts\python.exe" -c "import uvicorn, fastapi, huggingface_hub, PIL" >nul 2>&1
+:: 3. Reinstall dependencies whenever requirements.txt changed since the last install
+::    (.venv\requirements.installed is a copy of the file that was last installed)
+fc /b requirements.txt ".venv\requirements.installed" >nul 2>&1
 if errorlevel 1 (
-    echo [SETUP] Installing required dependencies into .venv ...
+    echo [SETUP] requirements.txt changed - installing dependencies into .venv ...
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Failed to install dependencies.
+        echo.
+        pause
+        exit /b 1
+    )
+    copy /y requirements.txt ".venv\requirements.installed" >nul
 )
 
 :: 4. Run application using .venv python directly
