@@ -1,0 +1,27 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "manga-studio",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "-m",
+        "uvicorn",
+        "app.server:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "7860"
+      ],
+      "port": 7860
+    },
+    {
+      "name": "library-test",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "C:\\Users\\mobas\\AppData\\Local\\Temp\\claude\\C--Users-mobas-Desktop-Games-Manga-Color-kaggle-tpu-image-gen\\f47d033b-113b-4b0d-936e-58849cb51072\\scratchpad\\launch_test.py"
+      ],
+      "port": 7872
+    }
+  ]
+}

@@ -47,3 +47,7 @@ Thumbs.db
 .vscode/
 .idea/
 .gemini/
+input_pages_backup/
+test_chapter/
+library.json
+kernel_library/

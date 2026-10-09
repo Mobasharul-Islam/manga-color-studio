@@ -41,11 +41,22 @@ document.addEventListener('DOMContentLoaded', () => {
   const submitUploadLoraBtn = document.getElementById('submitUploadLoraBtn');
   let selectedLoraFile = null;
 
-  // Cloud Dataset Elements
-  const lorasDatasetPill = document.getElementById('lorasDatasetPill');
-  const modelsDatasetPill = document.getElementById('modelsDatasetPill');
-  const syncLorasBtn = document.getElementById('syncLorasBtn');
-  const syncModelsBtn = document.getElementById('syncModelsBtn');
+  // Model & Kaggle library elements
+  let library = null;                // last /api/library snapshot
+  let libraryPollTimer = null;
+  const modelSelect = document.getElementById('modelSelect');
+  const addModelToggleBtn = document.getElementById('addModelToggleBtn');
+  const cacheModelBtn = document.getElementById('cacheModelBtn');
+  const deleteModelBtn = document.getElementById('deleteModelBtn');
+  const refreshLibraryBtn = document.getElementById('refreshLibraryBtn');
+  const addModelForm = document.getElementById('addModelForm');
+  const newModelUrl = document.getElementById('newModelUrl');
+  const newModelName = document.getElementById('newModelName');
+  const submitAddModelBtn = document.getElementById('submitAddModelBtn');
+  const addModelError = document.getElementById('addModelError');
+  const libraryActivity = document.getElementById('libraryActivity');
+  const legacyDatasets = document.getElementById('legacyDatasets');
+  const legacyList = document.getElementById('legacyList');
 
   // Prompt Section Elements & Presets
   const positivePromptInput = document.getElementById('positivePromptInput');
@@ -89,6 +100,19 @@ document.addEventListener('DOMContentLoaded', () => {
   let resultPairs = [];
   let isPolling = false;
   let activePairIndex = 0;
+
+  // Studio tools state (post-processing preview & page re-runs)
+  let currentChapter = null;
+  let canPostprocess = false;
+  let previewDirty = false;          // slider values differ from what the chapter's final pages use
+  const selectedPages = new Set();   // original scan names ticked in Grid View
+  const lineartSlider = document.getElementById('lineartSlider');
+  const lineartVal = document.getElementById('lineartVal');
+  const bubblesToggle = document.getElementById('bubblesToggle');
+  const applyPostBtn = document.getElementById('applyPostBtn');
+  const rerunPageBtn = document.getElementById('rerunPageBtn');
+  const rerunSelectedBtn = document.getElementById('rerunSelectedBtn');
+  const studioHint = document.getElementById('studioHint');
 
   // ==========================================
   // 1. CHAPTER & IMAGE SELECTION
@@ -378,33 +402,48 @@ document.addEventListener('DOMContentLoaded', () => {
   // ==========================================
 
   async function loadLoras() {
-    try {
-      const res = await fetch('/api/loras');
-      const data = await res.json();
-      installedLoras = data.loras || [];
-      renderLoraStack();
-    } catch (err) {
-      console.error('Failed to fetch LoRAs:', err);
+    await loadLibrary();
+  }
+
+  // Cache status shown on models and LoRAs.
+  function statusPill(item) {
+    const err = escapeHtml(item.error || '');
+    if (item.status === 'caching') return '<span class="pill pill-warning">Caching...</span>';
+    if (item.status === 'failed') return `<span class="pill pill-danger" title="${err}">Caching failed</span>`;
+    if (item.status === 'cached') {
+      const where = escapeHtml(item.dataset || '');
+      return item.legacy
+        ? `<span class="pill pill-success" title="In the older shared dataset ${where}">Cached (old dataset)</span>`
+        : `<span class="pill pill-success" title="${where}">Cached</span>`;
     }
+    return item.usable
+      ? '<span class="pill pill-muted" title="Downloaded from Hugging Face during each run">Not cached</span>'
+      : '<span class="pill pill-warning" title="Must be cached on Kaggle before it can be used">Needs caching</span>';
+  }
+
+  function canCache(item) {
+    return item.status !== 'caching' && (item.status !== 'cached' || item.legacy);
   }
 
   function renderLoraStack() {
     if (!loraStack) return;
     if (installedLoras.length === 0) {
-      loraStack.innerHTML = '<div class="loading-placeholder">No LoRAs configured. Click "Add LoRA" above.</div>';
+      loraStack.innerHTML = '<div class="loading-placeholder">No LoRAs yet. Click "Add LoRA" above.</div>';
       return;
     }
 
     loraStack.innerHTML = installedLoras.map((lora, idx) => {
-      const tagHtml = lora.is_turbo 
-        ? '<span class="lora-tag lora-tag-turbo">Turbo</span>'
-        : (lora.is_custom ? '<span class="lora-tag lora-tag-custom">Custom</span>' : '');
-      const deleteBtnHtml = lora.is_custom 
-        ? `<button type="button" class="btn-delete-lora" data-id="${lora.id}" title="Remove LoRA">&times;</button>` 
+      const tagHtml = lora.is_turbo ? '<span class="lora-tag lora-tag-turbo">Turbo</span>' : '';
+      const id = escapeHtml(lora.id);
+      const cacheBtn = canCache(lora)
+        ? `<button type="button" class="btn-icon-link btn-cache-item" data-id="${id}">${lora.status === 'failed' ? 'Retry' : 'Cache'}</button>`
         : '';
+      // Shown until a later attempt succeeds, even if an older dataset still serves the LoRA.
+      const errorHtml = lora.error && lora.status !== 'caching'
+        ? `<div class="lora-error">${lora.status === 'failed' ? '' : 'Last caching attempt failed: '}${linkify(lora.error)}</div>` : '';
 
       return `
-        <div class="lora-item ${lora.enabled ? 'active' : ''}" id="loraItem_${lora.id}">
+        <div class="lora-item ${lora.enabled ? 'active' : ''}" id="loraItem_${id}">
           <div class="lora-top">
             <label class="toggle-switch">
               <input type="checkbox" class="lora-toggle-input" data-index="${idx}" ${lora.enabled ? 'checked' : ''}>
@@ -415,10 +454,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 <span class="lora-name">${escapeHtml(lora.name)}</span>
                 ${tagHtml}
               </div>
-              <div class="lora-desc" title="${escapeHtml(lora.path || '')}">${escapeHtml(lora.description || lora.filename || lora.path || '')}</div>
+              <div class="lora-desc" title="${escapeHtml(lora.source || '')}">${escapeHtml(lora.description || lora.filename || lora.source || '')}</div>
+              <div class="lora-status-row">${statusPill(lora)} ${cacheBtn}</div>
+              ${errorHtml}
             </div>
-            <div class="lora-val-badge" id="loraBadge_${lora.id}">${parseFloat(lora.scale).toFixed(2)}</div>
-            ${deleteBtnHtml}
+            <div class="lora-val-badge" id="loraBadge_${id}">${parseFloat(lora.scale).toFixed(2)}</div>
+            <button type="button" class="btn-delete-lora" data-id="${id}" title="Remove LoRA">&times;</button>
           </div>
           <input type="range" class="range-slider lora-slider-input" data-index="${idx}" min="0.0" max="1.5" step="0.05" value="${lora.scale}">
         </div>
@@ -428,64 +469,47 @@ document.addEventListener('DOMContentLoaded', () => {
     // Attach Toggle Listeners
     loraStack.querySelectorAll('.lora-toggle-input').forEach(input => {
       input.addEventListener('change', (e) => {
-        const idx = parseInt(e.target.dataset.index);
-        const lora = installedLoras[idx];
-        if (lora) {
-          lora.enabled = e.target.checked;
-          const parentItem = document.getElementById(`loraItem_${lora.id}`);
-          if (parentItem) {
-            parentItem.classList.toggle('active', lora.enabled);
-          }
-          fetch('/api/loras/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: lora.id, enabled: lora.enabled })
-          }).catch(console.error);
-        }
+        const lora = installedLoras[parseInt(e.target.dataset.index)];
+        if (!lora) return;
+        lora.enabled = e.target.checked;
+        const parentItem = document.getElementById(`loraItem_${lora.id}`);
+        if (parentItem) parentItem.classList.toggle('active', lora.enabled);
+        fetch('/api/loras/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: lora.id, enabled: lora.enabled })
+        }).catch(console.error);
       });
     });
 
-    // Attach Range Slider Listeners
+    // Attach Range Slider Listeners (the weight is saved as the LoRA's default)
     loraStack.querySelectorAll('.lora-slider-input').forEach(slider => {
       slider.addEventListener('input', (e) => {
-        const idx = parseInt(e.target.dataset.index);
-        const lora = installedLoras[idx];
-        if (lora) {
-          lora.scale = parseFloat(e.target.value);
-          const badge = document.getElementById(`loraBadge_${lora.id}`);
-          if (badge) {
-            badge.textContent = lora.scale.toFixed(2);
-          }
-        }
+        const lora = installedLoras[parseInt(e.target.dataset.index)];
+        if (!lora) return;
+        lora.scale = parseFloat(e.target.value);
+        const badge = document.getElementById(`loraBadge_${lora.id}`);
+        if (badge) badge.textContent = lora.scale.toFixed(2);
       });
-
       slider.addEventListener('change', (e) => {
-        const idx = parseInt(e.target.dataset.index);
-        const lora = installedLoras[idx];
-        if (lora) {
-          fetch('/api/loras/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: lora.id, scale: lora.scale })
-          }).catch(console.error);
-        }
+        const lora = installedLoras[parseInt(e.target.dataset.index)];
+        if (!lora) return;
+        fetch('/api/loras/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: lora.id, scale: lora.scale })
+        }).catch(console.error);
       });
     });
 
-    // Attach Delete Listeners
+    loraStack.querySelectorAll('.btn-cache-item').forEach(btn => {
+      btn.addEventListener('click', () => cacheItem(btn.dataset.id));
+    });
+
     loraStack.querySelectorAll('.btn-delete-lora').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const loraId = btn.dataset.id;
-        if (!confirm('Are you sure you want to remove this LoRA?')) return;
-        try {
-          const res = await fetch(`/api/loras/${loraId}`, { method: 'DELETE' });
-          if (res.ok) {
-            installedLoras = installedLoras.filter(l => l.id !== loraId);
-            renderLoraStack();
-          }
-        } catch (err) {
-          console.error('Delete failed:', err);
-        }
+      btn.addEventListener('click', () => {
+        const lora = installedLoras.find(l => l.id === btn.dataset.id);
+        if (lora) deleteItem(lora);
       });
     });
   }
@@ -618,7 +642,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         const data = await res.json();
-        if (res.ok && data.status === 'success') {
+        if (res.ok) {
           if (newLoraUrl) newLoraUrl.value = '';
           if (newLoraName) newLoraName.value = '';
           if (newLoraScale) newLoraScale.value = '1.0';
@@ -676,7 +700,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         const data = await res.json();
-        if (res.ok && data.status === 'success') {
+        if (res.ok) {
           selectedLoraFile = null;
           if (loraFileNameLabel) loraFileNameLabel.textContent = 'Click or Drop .safetensors LoRA here';
           if (loraFileUploadBox) loraFileUploadBox.style.borderColor = 'var(--border)';
@@ -705,69 +729,230 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ==========================================
-  // 3. ZERO-WAIT DATASET CACHING STATUS & SYNC
+  // 3. MODEL & KAGGLE LIBRARY
   // ==========================================
+  // Each model / LoRA can be cached in its own private Kaggle dataset. Caching from a link
+  // runs in a CPU-only Kaggle notebook; the server queues these tasks one at a time.
 
-  async function checkDatasetStatus() {
+  function formatBytes(bytes) {
+    if (!bytes) return '';
+    return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`;
+  }
+
+  // Escapes text and turns URLs into links (errors point at the Kaggle notebook to fix secrets).
+  function linkify(text) {
+    return escapeHtml(text).replace(/https:\/\/www\.kaggle\.com\/[^\s<,]+/g,
+      url => `<a href="${url}" target="_blank" rel="noopener">${url}</a>`);
+  }
+
+  function libraryIsBusy(data) {
+    if (!data) return false;
+    const items = [...data.models, ...data.loras];
+    return !!data.tasks.current || data.tasks.pending > 0 || items.some(i => i.status === 'caching');
+  }
+
+  async function loadLibrary(refreshFromKaggle = false) {
     try {
-      const res = await fetch('/api/datasets/status');
+      const res = await fetch(refreshFromKaggle ? '/api/library/refresh' : '/api/library',
+        { method: refreshFromKaggle ? 'POST' : 'GET' });
       const data = await res.json();
-      if (lorasDatasetPill) {
-        if (data.loras && data.loras.exists) {
-          lorasDatasetPill.className = 'pill pill-success';
-          lorasDatasetPill.textContent = 'LoRAs: Synced (0-Wait)';
-        } else {
-          lorasDatasetPill.className = 'pill pill-warning';
-          lorasDatasetPill.textContent = 'LoRAs: Needs Sync';
-        }
+      if (!res.ok) {
+        // Not connected to Kaggle yet: still show the local library.
+        if (refreshFromKaggle) return loadLibrary(false);
+        return;
       }
-      if (modelsDatasetPill) {
-        if (data.models && data.models.exists) {
-          modelsDatasetPill.className = 'pill pill-success';
-          modelsDatasetPill.textContent = 'Model: Synced (0-Wait)';
-        } else {
-          modelsDatasetPill.className = 'pill pill-muted';
-          modelsDatasetPill.textContent = 'Model: Ready to Sync';
-        }
-      }
+      library = data;
+      installedLoras = data.loras || [];
+      renderModelSection();
+      renderLoraStack();
+      renderLibraryActivity();
     } catch (err) {
-      console.error('Dataset status check error:', err);
+      console.error('Failed to load library:', err);
+    }
+
+    clearTimeout(libraryPollTimer);
+    if (libraryIsBusy(library)) {
+      libraryPollTimer = setTimeout(() => loadLibrary(false), 5000);
     }
   }
 
-  if (syncLorasBtn) {
-    syncLorasBtn.addEventListener('click', async () => {
+  function activeModel() {
+    if (!library) return null;
+    return library.models.find(m => m.id === library.active_model) || null;
+  }
+
+  function renderModelSection() {
+    if (!library || !modelSelect) return;
+    modelSelect.innerHTML = library.models.map(m => {
+      const size = formatBytes(m.size_bytes);
+      return `<option value="${escapeHtml(m.id)}" ${m.id === library.active_model ? 'selected' : ''}>${escapeHtml(m.name)}${size ? ` (${size})` : ''}</option>`;
+    }).join('');
+
+    const model = activeModel();
+    // Looked up each time: replacing outerHTML swaps the element out.
+    const pill = document.getElementById('modelStatusPill');
+    if (pill) pill.outerHTML = (model ? statusPill(model) : '<span></span>').replace('<span ', '<span id="modelStatusPill" ').replace('<span>', '<span id="modelStatusPill">');
+    if (cacheModelBtn) {
+      cacheModelBtn.hidden = !model || !canCache(model);
+      cacheModelBtn.textContent = model && model.status === 'failed' ? 'Retry caching' : 'Cache on Kaggle';
+    }
+    if (deleteModelBtn) deleteModelBtn.disabled = !model || library.models.length < 2 || model.status === 'caching';
+
+    if (legacyDatasets && legacyList) {
+      const legacy = library.legacy || [];
+      legacyDatasets.hidden = legacy.length === 0;
+      legacyList.innerHTML = legacy.map(d => `
+        <div class="legacy-row">
+          <div><strong>${escapeHtml(d.ref)}</strong> ${formatBytes(d.size_bytes)}<br>${escapeHtml(d.note)}${d.in_use ? ' <em>(still used until its items are re-cached)</em>' : ''}</div>
+          <button type="button" class="btn-icon-link btn-icon-danger btn-delete-legacy" data-ref="${escapeHtml(d.ref)}" data-in-use="${d.in_use ? '1' : ''}">Delete</button>
+        </div>
+      `).join('');
+      legacyList.querySelectorAll('.btn-delete-legacy').forEach(btn => {
+        btn.addEventListener('click', () => deleteLegacy(btn.dataset.ref, !!btn.dataset.inUse));
+      });
+    }
+  }
+
+  function renderLibraryActivity() {
+    if (!libraryActivity || !library) return;
+    const t = library.tasks;
+    const lines = [];
+    if (t.current) {
+      const secs = Math.round(Date.now() / 1000 - t.current.started);
+      lines.push(`Working: ${escapeHtml(t.current.label)} (${Math.floor(secs / 60)}m ${secs % 60}s)${t.pending ? `, ${t.pending} more queued` : ''}`);
+    }
+    const lastError = (t.history || []).find(h => !h.ok);
+    if (lastError && (!t.history[0] || t.history[0] === lastError)) {
+      lines.push(`<span class="activity-error">${escapeHtml(lastError.label)} failed: ${linkify(lastError.error || '')}</span>`);
+    }
+    libraryActivity.innerHTML = lines.join('<br>');
+    libraryActivity.hidden = lines.length === 0;
+  }
+
+  async function libraryRequest(url, options = {}) {
+    const res = await fetch(url, options);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Request failed (${res.status})`);
+    return data;
+  }
+
+  async function cacheItem(id) {
+    try {
+      await libraryRequest(`/api/library/items/${encodeURIComponent(id)}/cache`, { method: 'POST' });
+    } catch (err) {
+      alert(err.message);
+    }
+    loadLibrary();
+  }
+
+  async function deleteItem(item) {
+    const kind = item.kind === 'model' ? 'model' : 'LoRA';
+    let detail;
+    if (item.dataset && !item.legacy) {
+      detail = `This permanently deletes the Kaggle dataset ${item.dataset}${item.size_bytes ? ` (${formatBytes(item.size_bytes)})` : ''}. This cannot be undone.`;
+    } else if (item.legacy) {
+      detail = `It is removed from the app only; the older shared dataset ${item.dataset} is kept.`;
+    } else {
+      detail = 'It is not cached on Kaggle, so only the library entry is removed.';
+    }
+    if (!confirm(`Delete ${kind} "${item.name}"?\n\n${detail}`)) return;
+    try {
+      await libraryRequest(`/api/library/items/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+    } catch (err) {
+      alert(err.message);
+    }
+    loadLibrary();
+  }
+
+  async function deleteLegacy(ref, inUse) {
+    const warning = inUse
+      ? '\n\nSome library items still use it. Until you cache them again, runs download them from Hugging Face instead.'
+      : '';
+    if (!confirm(`Permanently delete the Kaggle dataset ${ref}? This cannot be undone.${warning}`)) return;
+    const [owner, slug] = ref.split('/');
+    try {
+      await libraryRequest(`/api/library/legacy/${encodeURIComponent(owner)}/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+    } catch (err) {
+      alert(err.message);
+    }
+    loadLibrary();
+  }
+
+  if (modelSelect) {
+    modelSelect.addEventListener('change', async () => {
       try {
-        syncLorasBtn.disabled = true;
-        if (lorasDatasetPill) {
-          lorasDatasetPill.className = 'pill pill-warning';
-          lorasDatasetPill.textContent = 'LoRAs: Syncing...';
-        }
-        await fetch('/api/datasets/sync-loras', { method: 'POST' });
-        alert('LoRA dataset synchronization started in background! Check execution log.');
+        library = await libraryRequest('/api/library/models/active', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: modelSelect.value })
+        });
+        renderModelSection();
       } catch (err) {
-        alert('Failed to trigger LoRA dataset sync.');
-      } finally {
-        syncLorasBtn.disabled = false;
+        alert(err.message);
       }
     });
   }
 
-  if (syncModelsBtn) {
-    syncModelsBtn.addEventListener('click', async () => {
+  if (cacheModelBtn) {
+    cacheModelBtn.addEventListener('click', () => {
+      const model = activeModel();
+      if (model) cacheItem(model.id);
+    });
+  }
+
+  if (deleteModelBtn) {
+    deleteModelBtn.addEventListener('click', () => {
+      const model = activeModel();
+      if (model) deleteItem(model);
+    });
+  }
+
+  if (refreshLibraryBtn) {
+    refreshLibraryBtn.addEventListener('click', async () => {
+      refreshLibraryBtn.disabled = true;
+      await loadLibrary(true);
+      refreshLibraryBtn.disabled = false;
+    });
+  }
+
+  if (addModelToggleBtn && addModelForm) {
+    addModelToggleBtn.addEventListener('click', () => {
+      addModelForm.hidden = !addModelForm.hidden;
+      if (!addModelForm.hidden && newModelUrl) newModelUrl.focus();
+    });
+  }
+
+  if (submitAddModelBtn) {
+    submitAddModelBtn.addEventListener('click', async () => {
+      const url = newModelUrl ? newModelUrl.value.trim() : '';
+      if (!url) return;
+      submitAddModelBtn.disabled = true;
+      submitAddModelBtn.textContent = 'Checking...';
+      if (addModelError) addModelError.hidden = true;
       try {
-        syncModelsBtn.disabled = true;
-        if (modelsDatasetPill) {
-          modelsDatasetPill.className = 'pill pill-warning';
-          modelsDatasetPill.textContent = 'Model: Uploading...';
-        }
-        await fetch('/api/datasets/sync-models', { method: 'POST' });
-        alert('Anima Base model dataset synchronization started in background! Check execution log.');
+        const data = await libraryRequest('/api/library/models/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, name: newModelName ? newModelName.value.trim() : '' })
+        });
+        if (newModelUrl) newModelUrl.value = '';
+        if (newModelName) newModelName.value = '';
+        addModelForm.hidden = true;
+        // Select the new model so it is used once cached (it downloads from HF until then).
+        await libraryRequest('/api/library/models/active', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: data.item.id })
+        });
       } catch (err) {
-        alert('Failed to trigger Model dataset sync.');
-      } finally {
-        syncModelsBtn.disabled = false;
+        if (addModelError) {
+          addModelError.textContent = err.message;
+          addModelError.hidden = false;
+        }
       }
+      submitAddModelBtn.disabled = false;
+      submitAddModelBtn.textContent = 'Add & cache';
+      loadLibrary();
     });
   }
 
@@ -1026,55 +1211,66 @@ document.addEventListener('DOMContentLoaded', () => {
   // 5. START COLORIZATION & POLLING
   // ==========================================
 
-  if (startColorizeBtn) {
-    startColorizeBtn.addEventListener('click', async () => {
-      const lorasPayload = installedLoras.map(l => ({
-        name: l.name,
-        path: l.path || l.filename,
-        scale: parseFloat(l.scale),
-        enabled: !!l.enabled,
-        is_turbo: !!l.is_turbo
-      }));
+  // Job settings from the left panel; `overrides` sets chapter_name / pages for re-runs.
+  function buildJobPayload(overrides = {}) {
+    const lorasPayload = installedLoras.map(l => ({
+      name: l.name,
+      path: l.path || l.filename,
+      scale: parseFloat(l.scale),
+      enabled: !!l.enabled,
+      is_turbo: !!l.is_turbo
+    }));
 
-      const resolutionSelect = document.getElementById('resolutionSelect');
-      const stepsSelect = document.getElementById('stepsSelect');
+    const resolutionSelect = document.getElementById('resolutionSelect');
+    const stepsSelect = document.getElementById('stepsSelect');
 
-      const payload = {
-        chapter_name: (loadedFolderLabel && loadedFolderLabel.textContent.split(' (')[0]) || 'chapter_01',
-        max_dim: resolutionSelect ? parseInt(resolutionSelect.value) : 1440,
-        num_steps: stepsSelect ? parseInt(stepsSelect.value) : 8,
-        guidance_scale: guidanceScaleSlider ? parseFloat(guidanceScaleSlider.value) : 1.0,
-        prompt: positivePromptInput ? positivePromptInput.value.trim() : '',
-        negative_prompt: negativePromptInput ? negativePromptInput.value.trim() : '',
-        loras: lorasPayload
-      };
+    return {
+      chapter_name: (loadedFolderLabel && loadedFolderLabel.textContent.split(' (')[0]) || 'chapter_01',
+      max_dim: resolutionSelect ? parseInt(resolutionSelect.value) : 1440,
+      num_steps: stepsSelect ? parseInt(stepsSelect.value) : 8,
+      guidance_scale: guidanceScaleSlider ? parseFloat(guidanceScaleSlider.value) : 1.0,
+      prompt: positivePromptInput ? positivePromptInput.value.trim() : '',
+      negative_prompt: negativePromptInput ? negativePromptInput.value.trim() : '',
+      loras: lorasPayload,
+      ...overrides
+    };
+  }
 
-      try {
+  async function startJob(payload) {
+    try {
+      if (startColorizeBtn) {
         startColorizeBtn.disabled = true;
         startColorizeBtn.innerHTML = 'Starting TPU Cluster...';
-        const res = await fetch('/api/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        if (res.ok) {
-          startPolling();
-        } else {
-          alert(data.detail || 'Failed to start job');
-          startColorizeBtn.disabled = false;
-          startColorizeBtn.textContent = 'Colorize Chapter on 8-Core TPU';
-        }
-      } catch (err) {
-        console.error(err);
-        startColorizeBtn.disabled = false;
       }
-    });
+      const res = await fetch('/api/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (res.ok) {
+        startPolling();
+        return true;
+      }
+      alert(data.detail || 'Failed to start job');
+    } catch (err) {
+      console.error(err);
+    }
+    if (startColorizeBtn) {
+      startColorizeBtn.disabled = false;
+      startColorizeBtn.textContent = 'Colorize Chapter on 8-Core TPU';
+    }
+    return false;
+  }
+
+  if (startColorizeBtn) {
+    startColorizeBtn.addEventListener('click', () => startJob(buildJobPayload()));
   }
 
   function startPolling() {
     if (isPolling) return;
     isPolling = true;
+    updateRerunButtons();
     const pollInterval = setInterval(async () => {
       try {
         const res = await fetch('/api/status');
@@ -1146,6 +1342,7 @@ document.addEventListener('DOMContentLoaded', () => {
           setCoresActive(false);
           clearInterval(pollInterval);
           isPolling = false;
+          updateRerunButtons();
           if (startColorizeBtn) {
             startColorizeBtn.disabled = false;
             startColorizeBtn.textContent = 'Colorize Chapter on 8-Core TPU';
@@ -1156,6 +1353,7 @@ document.addEventListener('DOMContentLoaded', () => {
           setCoresActive(false);
           clearInterval(pollInterval);
           isPolling = false;
+          updateRerunButtons();
           if (startColorizeBtn) {
             startColorizeBtn.disabled = false;
             startColorizeBtn.textContent = 'Colorize Chapter on 8-Core TPU';
@@ -1184,7 +1382,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  async function loadResults(chapterName = null) {
+  async function loadResults(chapterName = null, keepPage = false) {
     try {
       const url = chapterName ? `/api/results?chapter=${encodeURIComponent(chapterName)}` : '/api/results';
       const res = await fetch(url);
@@ -1192,15 +1390,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
       // Populate available chapters
       if (galleryChapterSelect && data.available_chapters && data.available_chapters.length) {
-        galleryChapterSelect.innerHTML = data.available_chapters.map(ch => 
-          `<option value="${ch}" ${ch === data.chapter_name ? 'selected' : ''}>${ch.replace(/_/g, ' ')}</option>`
+        galleryChapterSelect.innerHTML = data.available_chapters.map(ch =>
+          `<option value="${escapeHtml(ch)}" ${ch === data.chapter_name ? 'selected' : ''}>${escapeHtml(ch.replace(/_/g, ' '))}</option>`
         ).join('');
       }
 
+      const chapterChanged = data.chapter_name !== currentChapter;
+      currentChapter = data.chapter_name;
+      canPostprocess = !!data.can_postprocess;
+      previewDirty = false;
+      if (chapterChanged) selectedPages.clear();
+      syncStudioTools(data.postprocess);
+
+      const prevIndex = activePairIndex;
       resultPairs = data.pairs || [];
       if (resultPairs.length > 0) {
         renderGallery(resultPairs);
-        selectComparisonPage(0);
+        selectComparisonPage(keepPage && !chapterChanged ? Math.min(prevIndex, resultPairs.length - 1) : 0);
       } else {
         if (compColorImg) {
           compColorImg.removeAttribute('src');
@@ -1263,25 +1469,51 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     }
 
-    // Render Grid View
-    resultsGrid.innerHTML = pairs.map((pair, idx) => `
-      <div class="grid-card">
-        <img src="${pair.color_url}" alt="${pair.id}" loading="lazy">
+    // Render Grid View (tick boxes select pages for re-running)
+    resultsGrid.innerHTML = pairs.map((pair, idx) => {
+      const checked = pair.page && selectedPages.has(pair.page);
+      const selectBox = pair.page
+        ? `<input type="checkbox" class="rerun-check" data-page="${escapeHtml(pair.page)}" ${checked ? 'checked' : ''}>`
+        : '';
+      return `
+      <div class="grid-card ${checked ? 'selected' : ''}">
+        <img src="${pair.color_url}" alt="${escapeHtml(pair.id)}" loading="lazy">
         <div class="grid-card-footer">
-          <span>Page ${idx + 1}</span>
-          <a href="${pair.color_url}" download="${pair.color_name}" class="btn-text-danger" style="color: var(--primary);">Save</a>
+          <label class="grid-select">${selectBox} Page ${idx + 1}</label>
+          <a href="${pair.color_url}" download="${escapeHtml(pair.color_name)}" class="btn-text-danger" style="color: var(--primary);">Save</a>
         </div>
       </div>
-    `).join('');
+    `;
+    }).join('');
+
+    resultsGrid.querySelectorAll('.rerun-check').forEach(box => {
+      box.addEventListener('change', () => {
+        if (box.checked) selectedPages.add(box.dataset.page);
+        else selectedPages.delete(box.dataset.page);
+        box.closest('.grid-card').classList.toggle('selected', box.checked);
+        updateRerunButtons();
+      });
+    });
+    updateRerunButtons();
+  }
+
+  function colorUrlFor(pair) {
+    if (!previewDirty || !canPostprocess || !currentChapter) return pair.color_url;
+    const params = new URLSearchParams({
+      lineart: lineartSlider ? lineartSlider.value : '0',
+      bubbles: bubblesToggle && bubblesToggle.checked ? 'true' : 'false'
+    });
+    return `/api/image/preview/${encodeURIComponent(currentChapter)}/${encodeURIComponent(pair.color_name)}?${params}`;
   }
 
   function selectComparisonPage(idx) {
     if (!resultPairs[idx]) return;
     activePairIndex = idx;
     const pair = resultPairs[idx];
+    const colorUrl = colorUrlFor(pair);
 
     if (compColorImg) {
-      compColorImg.src = pair.color_url;
+      compColorImg.src = colorUrl;
       compColorImg.style.display = 'block';
     }
     if (compInputImg) {
@@ -1289,13 +1521,14 @@ document.addEventListener('DOMContentLoaded', () => {
       compInputImg.style.display = 'block';
     }
     if (sbsColorImg) {
-      sbsColorImg.src = pair.color_url;
+      sbsColorImg.src = colorUrl;
       sbsColorImg.style.display = 'block';
     }
     if (sbsInputImg) {
       sbsInputImg.src = pair.input_url || pair.color_url;
       sbsInputImg.style.display = 'block';
     }
+    if (rerunPageBtn) rerunPageBtn.disabled = !pair.page || isPolling;
 
     if (pageCarousel) {
       pageCarousel.querySelectorAll('.page-thumb').forEach((thumb, i) => {
@@ -1307,6 +1540,107 @@ document.addEventListener('DOMContentLoaded', () => {
         thumb.classList.toggle('active', i === idx);
       });
     }
+  }
+
+  // ==========================================
+  // 6b. POST-PROCESSING & PAGE RE-RUNS
+  // ==========================================
+
+  function syncStudioTools(settings) {
+    if (settings) {
+      if (lineartSlider) lineartSlider.value = settings.lineart_strength;
+      if (lineartVal) lineartVal.textContent = parseFloat(settings.lineart_strength).toFixed(2);
+      if (bubblesToggle) bubblesToggle.checked = !!settings.preserve_bubbles;
+    }
+    if (lineartSlider) lineartSlider.disabled = !canPostprocess;
+    if (bubblesToggle) bubblesToggle.disabled = !canPostprocess;
+    if (applyPostBtn) {
+      applyPostBtn.disabled = !canPostprocess || !previewDirty;
+      applyPostBtn.classList.toggle('dirty', previewDirty);
+    }
+    if (studioHint) {
+      studioHint.textContent = (currentChapter && !canPostprocess)
+        ? 'This chapter was colorized before original scans were kept, so lineart/bubble restore and re-runs are unavailable. Colorize it again to enable them.'
+        : '';
+    }
+    updateRerunButtons();
+  }
+
+  function updateRerunButtons() {
+    if (rerunSelectedBtn) {
+      rerunSelectedBtn.textContent = `Re-run selected (${selectedPages.size})`;
+      rerunSelectedBtn.disabled = selectedPages.size === 0 || isPolling;
+    }
+    if (rerunPageBtn) {
+      const pair = resultPairs[activePairIndex];
+      rerunPageBtn.disabled = !pair || !pair.page || isPolling;
+    }
+  }
+
+  let previewTimer = null;
+  function onPostSettingsChanged() {
+    if (lineartVal && lineartSlider) lineartVal.textContent = parseFloat(lineartSlider.value).toFixed(2);
+    previewDirty = true;
+    syncStudioTools();
+    // Debounced live preview of the current page; the chapter is only rewritten on Apply.
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => selectComparisonPage(activePairIndex), 250);
+  }
+
+  if (lineartSlider) lineartSlider.addEventListener('input', onPostSettingsChanged);
+  if (bubblesToggle) bubblesToggle.addEventListener('change', onPostSettingsChanged);
+
+  if (applyPostBtn) {
+    applyPostBtn.addEventListener('click', async () => {
+      if (!currentChapter) return;
+      applyPostBtn.disabled = true;
+      applyPostBtn.textContent = 'Applying...';
+      try {
+        const res = await fetch('/api/postprocess', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chapter: currentChapter,
+            lineart_strength: parseFloat(lineartSlider.value),
+            preserve_bubbles: bubblesToggle.checked
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.detail || 'Post-processing failed');
+        } else {
+          await loadResults(currentChapter, true);
+        }
+      } catch (err) {
+        console.error('Post-process error:', err);
+      }
+      applyPostBtn.textContent = 'Apply to chapter';
+      syncStudioTools();
+    });
+  }
+
+  async function rerunPages(pages) {
+    if (!currentChapter || !pages.length) return;
+    const label = pages.length === 1 ? '1 page' : `${pages.length} pages`;
+    const ok = confirm(
+      `Re-run ${label} of "${currentChapter.replace(/_/g, ' ')}" on the Kaggle TPU with the current prompt and LoRA settings?\n\n` +
+      'The current versions are kept in the chapter\'s history folder.'
+    );
+    if (!ok) return;
+    if (await startJob(buildJobPayload({ chapter_name: currentChapter, pages }))) {
+      selectedPages.clear();
+      renderGallery(resultPairs);
+    }
+  }
+
+  if (rerunPageBtn) {
+    rerunPageBtn.addEventListener('click', () => {
+      const pair = resultPairs[activePairIndex];
+      if (pair && pair.page) rerunPages([pair.page]);
+    });
+  }
+  if (rerunSelectedBtn) {
+    rerunSelectedBtn.addEventListener('click', () => rerunPages([...selectedPages]));
   }
 
   // Interactive Comparison Split Slider
@@ -1441,6 +1775,5 @@ document.addEventListener('DOMContentLoaded', () => {
   // ==========================================
   checkSettings(false);
   loadResults();
-  loadLoras();
-  checkDatasetStatus();
+  loadLibrary(true);
 });

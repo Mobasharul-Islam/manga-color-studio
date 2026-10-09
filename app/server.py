@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import sys
@@ -12,11 +13,16 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
+from PIL import Image
+
+from scripts.common import (
+    IMAGE_EXTS, KERNEL_SLUG, SCANS_DATASET_SLUG, natural_key, safe_name, resolve_kaggle_username,
+)
+from app import library, postprocess
 
 try:
     from kaggle.api.kaggle_api_extended import KaggleApi
@@ -45,14 +51,8 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(NoCacheMiddleware)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# No CORS middleware on purpose: the UI is served from this same origin, and allowing
+# other origins would let any website read tokens or files through this local server.
 
 # Global Job State
 job_state = {
@@ -83,311 +83,6 @@ def log_message(msg: str):
             job_state["logs"].pop(0)
 
 
-# Base directories & paths
-LORAS_DIR = BASE_DIR / "loras"
-LORAS_DIR.mkdir(parents=True, exist_ok=True)
-LORAS_CONFIG = BASE_DIR / "loras.json"
-
-DEFAULT_LORAS = [
-    {
-        "id": "color_manga",
-        "name": "Color Manga Anima (Base Style)",
-        "path": "Kutches/Anim4/colorMangaAnima.safetensors",
-        "filename": "colorMangaAnima.safetensors",
-        "scale": 1.0,
-        "enabled": True,
-        "is_turbo": False,
-        "is_custom": False,
-        "description": "Transforms lineart into rich, full-color anime shading."
-    },
-    {
-        "id": "turbo_8step",
-        "name": "Anima Turbo (8-Step Fast)",
-        "path": "circlestone-labs/Anima-Official-LoRAs/anima-turbo-lora-v0.2.safetensors",
-        "filename": "anima-turbo-lora-v0.2.safetensors",
-        "scale": 1.0,
-        "enabled": True,
-        "is_turbo": True,
-        "is_custom": False,
-        "description": "Accelerates generation down to 8 steps per page on TPU."
-    }
-]
-
-
-def load_loras_config() -> List[Dict[str, Any]]:
-    staging_dir = BASE_DIR / "kaggle_datasets" / "Loras_Manga_Coloring_Anima"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-
-    current_loras = [dict(l) for l in DEFAULT_LORAS]
-    if LORAS_CONFIG.exists():
-        try:
-            with open(LORAS_CONFIG, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                loaded = data.get("loras", [])
-                if loaded:
-                    current_loras = loaded
-        except Exception as e:
-            print("Error reading loras.json:", e)
-
-    # 1. Prune entries if their safetensors file does not exist locally (except built-in defaults)
-    existing_files = {p.name for p in LORAS_DIR.glob("*.safetensors")}.union(
-        {p.name for p in staging_dir.glob("*.safetensors")}
-    )
-
-    filtered_loras = []
-    for l in current_loras:
-        fname = l.get("filename")
-        if fname:
-            if fname in existing_files:
-                filtered_loras.append(l)
-        else:
-            filtered_loras.append(l)
-
-    current_loras = filtered_loras
-
-    # 2. Auto-scan local directories & Kaggle dataset folders for any present .safetensors
-    known_filenames = {l.get("filename") for l in current_loras if l.get("filename")}
-    known_ids = {l.get("id") for l in current_loras if l.get("id")}
-    
-    scan_dirs = [
-        LORAS_DIR,
-        staging_dir,
-        BASE_DIR / "kaggle_datasets" / "loras_manga_coloring_anima",
-        BASE_DIR / "kaggle_datasets" / "loras-manga-coloring-anima",
-    ]
-    
-    for s_dir in scan_dirs:
-        if s_dir.exists():
-            for sf in s_dir.glob("*.safetensors"):
-                # Sync between loras/ and kaggle_datasets/
-                dst_local = LORAS_DIR / sf.name
-                dst_staging = staging_dir / sf.name
-                if not dst_local.exists():
-                    shutil.copy2(sf, dst_local)
-                if not dst_staging.exists():
-                    shutil.copy2(sf, dst_staging)
-
-                if sf.name not in known_filenames:
-                    lora_id = re.sub(r'[^a-zA-Z0-9_]', '_', sf.stem).lower()
-                    if lora_id in known_ids:
-                        lora_id = f"{lora_id}_{int(time.time()) % 1000}"
-                    
-                    name = sf.stem.replace('_', ' ').replace('-', ' ')
-                    new_item = {
-                        "id": lora_id,
-                        "name": name,
-                        "path": sf.name,
-                        "filename": sf.name,
-                        "scale": 1.0,
-                        "enabled": False,
-                        "is_turbo": "turbo" in sf.name.lower(),
-                        "is_custom": True,
-                        "description": f"Dataset LoRA: {sf.name}"
-                    }
-                    current_loras.append(new_item)
-                    known_filenames.add(sf.name)
-                    known_ids.add(lora_id)
-
-    save_loras_config(current_loras)
-    return current_loras
-
-
-def save_loras_config(loras_list: List[Dict[str, Any]]) -> None:
-    with open(LORAS_CONFIG, "w", encoding="utf-8") as f:
-        json.dump({"loras": loras_list}, f, indent=2)
-
-
-import requests
-from urllib.parse import urlparse, unquote, parse_qs
-from huggingface_hub import hf_hub_download
-
-
-def resolve_civitai_download_url(url: str, session: requests.Session, civitai_token: str = "") -> tuple[str, str]:
-    """If url is a Civitai model page or API URL, resolves the direct download link and filename."""
-    try:
-        # Normalize civitai.red, civitai.green, etc. to civitai.com
-        url = re.sub(r'https?://civitai\.(red|green|blue|org)/', 'https://civitai.com/', url)
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
-        model_version_id = qs.get("modelVersionId", [None])[0]
-
-        headers = {}
-        if civitai_token:
-            headers["Authorization"] = f"Bearer {civitai_token}"
-
-        m = re.search(r'/models/(\d+)', parsed.path)
-        if m:
-            model_id = m.group(1)
-            if model_version_id:
-                api_url = f"https://civitai.com/api/v1/model-versions/{model_version_id}"
-                r = session.get(api_url, headers=headers, timeout=15)
-                if r.status_code == 200:
-                    vdata = r.json()
-                    dl_url = vdata.get("downloadUrl")
-                    files = vdata.get("files", [])
-                    fname = files[0].get("name", "") if files else ""
-                    name = vdata.get("name", "")
-                    return dl_url or f"https://civitai.com/api/download/models/{model_version_id}", fname or name
-            else:
-                api_url = f"https://civitai.com/api/v1/models/{model_id}"
-                r = session.get(api_url, headers=headers, timeout=15)
-                if r.status_code == 200:
-                    mdata = r.json()
-                    versions = mdata.get("modelVersions", [])
-                    if versions:
-                        v = versions[0]
-                        dl_url = v.get("downloadUrl")
-                        files = v.get("files", [])
-                        fname = files[0].get("name", "") if files else ""
-                        name = mdata.get("name", "")
-                        return dl_url or f"https://civitai.com/api/download/models/{v.get('id')}", fname or name
-    except Exception as e:
-        print("Civitai URL resolution note:", e)
-
-    return url, ""
-
-
-def download_lora_from_url(url_or_path: str, custom_name: str = "", civitai_token: str = "") -> Dict[str, Any]:
-    """Downloads a LoRA file from Hugging Face, Civitai, or direct URL into local loras/ folder."""
-    url_or_path = url_or_path.strip()
-    hf_token = os.getenv("HF_TOKEN") or None
-    civitai_token = civitai_token or os.getenv("CIVITAI_TOKEN", "")
-
-    # 1. Hugging Face repo path: e.g. "Kutches/Anim4/colorMangaAnima.safetensors"
-    if not url_or_path.startswith("http://") and not url_or_path.startswith("https://"):
-        parts = url_or_path.split("/")
-        if len(parts) >= 2:
-            repo_id = "/".join(parts[:-1])
-            fname = parts[-1]
-            if not fname.endswith(".safetensors"):
-                fname += ".safetensors"
-            log_message(f"Downloading LoRA via Hugging Face Hub: {repo_id}/{fname}...")
-            cached_path = hf_hub_download(repo_id=repo_id, filename=fname, token=hf_token)
-            dest = LORAS_DIR / fname
-            shutil.copy2(cached_path, dest)
-            lora_id = re.sub(r'[^a-zA-Z0-9_]', '_', fname.replace('.safetensors', '')).lower()
-            name = custom_name or fname.replace('.safetensors', '').replace('_', ' ')
-            return {
-                "id": lora_id,
-                "name": name,
-                "path": url_or_path,
-                "filename": fname,
-                "local_path": str(dest)
-            }
-        else:
-            raise ValueError(f"Invalid LoRA repo format: {url_or_path}")
-
-    # 2. Hugging Face Web URLs: https://huggingface.co/org/repo/blob/main/file.safetensors
-    m_hf = re.match(r'https?://huggingface\.co/([^/]+)/([^/]+)/(?:blob|resolve)/([^/]+)/(.+)', url_or_path)
-    if m_hf:
-        user_org, repo_name, revision, subpath = m_hf.groups()
-        repo_id = f"{user_org}/{repo_name}"
-        log_message(f"Detected Hugging Face repo '{repo_id}', file '{subpath}'...")
-        try:
-            cached_path = hf_hub_download(repo_id=repo_id, filename=subpath, revision=revision, token=hf_token)
-            fname = Path(subpath).name
-            dest = LORAS_DIR / fname
-            shutil.copy2(cached_path, dest)
-            lora_id = re.sub(r'[^a-zA-Z0-9_]', '_', fname.replace('.safetensors', '')).lower()
-            name = custom_name or fname.replace('.safetensors', '').replace('_', ' ')
-            return {
-                "id": lora_id,
-                "name": name,
-                "path": f"{repo_id}/{subpath}",
-                "filename": fname,
-                "local_path": str(dest)
-            }
-        except Exception as hf_err:
-            log_message(f"hf_hub_download fallback to direct HTTP: {hf_err}")
-
-    # 3. HTTP / HTTPS with browser session (Civitai, Cloudflare, Direct Link)
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/octet-stream,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1"
-    })
-
-    target_url = url_or_path
-    inferred_name = ""
-    if "civitai" in target_url:
-        target_url, inferred_name = resolve_civitai_download_url(target_url, session, civitai_token)
-        # Normalize civitai host to civitai.com
-        target_url = re.sub(r'https?://civitai\.(red|green|blue|org)/', 'https://civitai.com/', target_url)
-        if civitai_token and "token=" not in target_url:
-            separator = "&" if "?" in target_url else "?"
-            target_url = f"{target_url}{separator}token={civitai_token}"
-
-    headers = {}
-    if "huggingface.co" in target_url and hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-    elif "civitai.com" in target_url and civitai_token:
-        headers["Authorization"] = f"Bearer {civitai_token}"
-
-    log_message(f"Connecting to download source: {target_url[:80]}...")
-    resp = session.get(target_url, headers=headers, stream=True, allow_redirects=True, timeout=30)
-
-    # Check for Civitai login redirect / auth block
-    if resp.status_code in (401, 403) or (resp.history and any("/login" in r.headers.get("location", "") for r in resp.history)) or "/login" in resp.url:
-        raise RuntimeError(
-            "This Civitai LoRA requires authentication (Mature/NSFW content flag). "
-            "Please provide your Civitai API Key in the box below, or upload the .safetensors file directly using the 'Upload from PC' tab."
-        )
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"HTTP Error {resp.status_code} ({resp.reason}) from download URL. Check if the link is public or requires authentication.")
-
-    # Extract filename from Content-Disposition header
-    cd = resp.headers.get("content-disposition", "")
-    fname = ""
-    if cd:
-        cd_match = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';\r\n]+)["\']?', cd, re.IGNORECASE)
-        if cd_match:
-            fname = unquote(cd_match.group(1)).strip()
-
-    if not fname or not fname.endswith(".safetensors"):
-        parsed_final = urlparse(resp.url)
-        url_fname = unquote(Path(parsed_final.path).name)
-        if url_fname and url_fname.endswith(".safetensors"):
-            fname = url_fname
-
-    if not fname:
-        fname = f"{custom_name or inferred_name or 'custom_lora'}".replace(" ", "_")
-        if not fname.endswith(".safetensors"):
-            fname += ".safetensors"
-
-    dest = LORAS_DIR / fname
-    total_size = int(resp.headers.get("content-length", 0))
-    downloaded = 0
-
-    log_message(f"Downloading '{fname}' ({total_size / (1024*1024):.1f} MB)..." if total_size else f"Downloading '{fname}'...")
-    with open(dest, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-                downloaded += len(chunk)
-
-    log_message(f"Downloaded '{fname}' successfully ({downloaded / (1024*1024):.1f} MB).")
-
-    lora_id = re.sub(r'[^a-zA-Z0-9_]', '_', fname.replace('.safetensors', '')).lower()
-    name = custom_name or inferred_name or fname.replace('.safetensors', '').replace('_', ' ')
-    return {
-        "id": lora_id,
-        "name": name,
-        "path": url_or_path,
-        "filename": fname,
-        "local_path": str(dest)
-    }
-
-
 # Request Models
 class LoraConfig(BaseModel):
     id: Optional[str] = None
@@ -401,21 +96,6 @@ class LoraConfig(BaseModel):
     description: str = ""
 
 
-class AddLoraRequest(BaseModel):
-    name: Optional[str] = ""
-    url: str
-    scale: float = 1.0
-    is_turbo: bool = False
-    description: Optional[str] = ""
-    civitai_token: Optional[str] = ""
-
-
-class UpdateLoraRequest(BaseModel):
-    id: str
-    scale: Optional[float] = None
-    enabled: Optional[bool] = None
-
-
 class JobStartRequest(BaseModel):
     chapter_name: str = "chapter_01"
     max_dim: int = 1440
@@ -423,7 +103,36 @@ class JobStartRequest(BaseModel):
     guidance_scale: float = 1.0
     prompt: str = "masterpiece, best quality, anime style, highly detailed coloring, vibrant color harmony, crisp lineart"
     negative_prompt: str = "worst quality, low quality, blurry, artifact, oversaturated, deformed, greyscale, monochrome"
-    loras: List[LoraConfig] = []
+    loras: List[LoraConfig] = []  # ignored: LoRAs and model come from the library
+    # Original scan file names to re-run within an existing chapter; empty = whole chapter.
+    pages: List[str] = []
+
+
+def _image_item(path: Path) -> Dict[str, Any]:
+    return {
+        "name": path.name,
+        "path": str(path),
+        "size": path.stat().st_size,
+        "url": f"/api/image/input/{path.name}",
+    }
+
+
+def _reset_input_dir():
+    shutil.rmtree(INPUT_DIR, ignore_errors=True)
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _unique_input_name(base_name: str, parent: str = "") -> str:
+    """Keeps both files when two subfolders contain the same name (e.g. 001.jpg)."""
+    if not (INPUT_DIR / base_name).exists():
+        return base_name
+    prefix = safe_name(parent, "page")
+    candidate = f"{prefix}_{base_name}"
+    i = 2
+    while (INPUT_DIR / candidate).exists():
+        candidate = f"{prefix}_{i}_{base_name}"
+        i += 1
+    return candidate
 
 
 def open_file_dialog_thread():
@@ -493,9 +202,7 @@ async def upload_zip_endpoint(file: UploadFile = File(...)):
     if not (fname_lower.endswith(".zip") or fname_lower.endswith(".cbz")):
         raise HTTPException(status_code=400, detail="Please upload a valid .zip or .cbz manga chapter archive.")
 
-    # Clear current input directory
-    shutil.rmtree(INPUT_DIR, ignore_errors=True)
-    INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _reset_input_dir()
 
     temp_zip = BASE_DIR / f"temp_upload_{int(time.time())}.zip"
     try:
@@ -503,7 +210,6 @@ async def upload_zip_endpoint(file: UploadFile = File(...)):
             shutil.copyfileobj(file.file, buffer)
 
         import zipfile
-        image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
         uploaded = []
         raw_stem = Path(file.filename).stem
         detected_chapter = raw_stem
@@ -513,31 +219,22 @@ async def upload_zip_endpoint(file: UploadFile = File(...)):
                 if member.is_dir():
                     continue
                 member_path = Path(member.filename.replace("\\", "/"))
-                if member_path.suffix.lower() in image_extensions:
+                if member_path.suffix.lower() in IMAGE_EXTS:
                     base_name = member_path.name
                     # Ignore hidden / system files
                     if base_name.startswith("._") or base_name.startswith("."):
                         continue
-                    dst = INPUT_DIR / base_name
+                    dst = INPUT_DIR / _unique_input_name(base_name, member_path.parent.name)
                     with zf.open(member) as source, open(dst, "wb") as target:
                         shutil.copyfileobj(source, target)
-
-                    uploaded.append({
-                        "name": base_name,
-                        "path": str(dst),
-                        "size": dst.stat().st_size,
-                        "url": f"/api/image/input/{base_name}"
-                    })
+                    uploaded.append(_image_item(dst))
 
         if not uploaded:
             raise HTTPException(status_code=400, detail="No valid image files found inside the archive.")
 
-        def natural_sort_key(item):
-            return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', item["name"])]
+        uploaded = sorted(uploaded, key=lambda item: natural_key(item["name"]))
 
-        uploaded = sorted(uploaded, key=natural_sort_key)
-
-        clean_ch = re.sub(r'[^\w\-_.]', '_', detected_chapter) or "chapter_01"
+        clean_ch = safe_name(detected_chapter)
         with state_lock:
             job_state["chapter_name"] = clean_ch
             job_state["input_images"] = uploaded
@@ -567,7 +264,7 @@ async def upload_images(files: List[UploadFile] = File(...)):
     if len(files) == 1 and (files[0].filename.lower().endswith(".zip") or files[0].filename.lower().endswith(".cbz")):
         return await upload_zip_endpoint(files[0])
 
-    INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _reset_input_dir()
     uploaded = []
     detected_chapter = None
 
@@ -581,30 +278,20 @@ async def upload_images(files: List[UploadFile] = File(...)):
             detected_chapter = path_parts[0]
             
         base_name = path_parts[-1]
-        ext = Path(base_name).suffix.lower()
-        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+        if Path(base_name).suffix.lower() not in IMAGE_EXTS:
             continue
 
-        dst = INPUT_DIR / base_name
+        parent = path_parts[-2] if len(path_parts) > 1 else ""
+        dst = INPUT_DIR / _unique_input_name(base_name, parent)
         with open(dst, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        uploaded.append(_image_item(dst))
 
-        uploaded.append({
-            "name": base_name,
-            "path": str(dst),
-            "size": dst.stat().st_size,
-            "url": f"/api/image/input/{base_name}"
-        })
-
-    # Sort images by natural filename order
-    def natural_sort_key(item):
-        return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', item["name"])]
-
-    uploaded = sorted(uploaded, key=natural_sort_key)
+    uploaded = sorted(uploaded, key=lambda item: natural_key(item["name"]))
 
     with state_lock:
         if detected_chapter:
-            job_state["chapter_name"] = re.sub(r'[^\w\-_.]', '_', detected_chapter)
+            job_state["chapter_name"] = safe_name(detected_chapter)
         job_state["input_images"] = uploaded
         job_state["total_images"] = len(uploaded)
 
@@ -641,193 +328,6 @@ def clear_files():
     return {"status": "cleared"}
 
 
-@app.get("/api/loras")
-def get_loras():
-    """Returns list of all configured LoRAs."""
-    return {"loras": load_loras_config()}
-
-
-@app.post("/api/loras/add")
-async def add_lora_endpoint(req: AddLoraRequest):
-    """Downloads a new LoRA from link / HF path and registers it in loras.json."""
-    if not req.url:
-        raise HTTPException(status_code=400, detail="Please provide a LoRA download link or Hugging Face path.")
-    try:
-        info = await asyncio.to_thread(download_lora_from_url, req.url, req.name or "", req.civitai_token or "")
-        loras = load_loras_config()
-
-        # Check if already exists
-        for l in loras:
-            if l.get("filename") == info["filename"] or l.get("id") == info["id"]:
-                l["scale"] = req.scale
-                l["enabled"] = True
-                l["is_turbo"] = req.is_turbo
-                if req.name:
-                    l["name"] = req.name
-                save_loras_config(loras)
-                log_message(f"Updated existing LoRA: {l['name']}")
-                return {"status": "success", "lora": l, "updated": True}
-
-        new_lora = {
-            "id": info["id"],
-            "name": req.name or info["name"],
-            "path": info["path"],
-            "filename": info["filename"],
-            "scale": req.scale,
-            "enabled": True,
-            "is_turbo": req.is_turbo,
-            "is_custom": True,
-            "description": req.description or f"Custom LoRA: {info['filename']}"
-        }
-        loras.append(new_lora)
-        save_loras_config(loras)
-        log_message(f"Successfully added LoRA: {new_lora['name']} ({info['filename']})")
-        return {"status": "success", "lora": new_lora, "updated": False}
-    except Exception as e:
-        err_msg = str(e)
-        log_message(f"Failed to add LoRA: {err_msg}")
-        raise HTTPException(status_code=400, detail=f"Failed to download LoRA: {err_msg}")
-
-
-@app.post("/api/loras/upload")
-async def upload_lora_endpoint(
-    file: UploadFile = File(...),
-    name: Optional[str] = Form(""),
-    scale: float = Form(1.0),
-    is_turbo: bool = Form(False),
-    description: Optional[str] = Form("")
-):
-    """Uploads a local .safetensors LoRA file directly from the user's PC."""
-    if not file.filename.endswith(".safetensors"):
-        raise HTTPException(status_code=400, detail="Only .safetensors files are supported for LoRAs.")
-
-    dest = LORAS_DIR / file.filename
-    staging_dest = BASE_DIR / "kaggle_datasets" / "Loras_Manga_Coloring_Anima" / file.filename
-    staging_dest.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(dest, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        shutil.copy2(dest, staging_dest)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
-
-    lora_id = re.sub(r'[^a-zA-Z0-9_]', '_', file.filename.replace('.safetensors', '')).lower()
-    lora_name = name or file.filename.replace('.safetensors', '').replace('_', ' ')
-
-    loras = load_loras_config()
-    for l in loras:
-        if l.get("filename") == file.filename or l.get("id") == lora_id:
-            l["scale"] = scale
-            l["enabled"] = True
-            l["is_turbo"] = is_turbo
-            if name:
-                l["name"] = name
-            save_loras_config(loras)
-            log_message(f"Uploaded and updated LoRA: {l['name']}")
-            return {"status": "success", "lora": l, "updated": True}
-
-    new_lora = {
-        "id": lora_id,
-        "name": lora_name,
-        "path": file.filename,
-        "filename": file.filename,
-        "scale": scale,
-        "enabled": True,
-        "is_turbo": is_turbo,
-        "is_custom": True,
-        "description": description or f"Local LoRA: {file.filename}"
-    }
-    loras.append(new_lora)
-    save_loras_config(loras)
-    log_message(f"Successfully uploaded LoRA: {lora_name} ({file.filename})")
-    return {"status": "success", "lora": new_lora, "updated": False}
-
-
-@app.delete("/api/loras/{lora_id}")
-def delete_lora_endpoint(lora_id: str):
-    """Deletes a custom LoRA from loras.json and disk."""
-    loras = load_loras_config()
-    target = next((l for l in loras if l.get("id") == lora_id), None)
-    if not target:
-        raise HTTPException(status_code=404, detail="LoRA not found")
-
-    loras = [l for l in loras if l.get("id") != lora_id]
-    save_loras_config(loras)
-
-    # Delete local file if present in loras/ and staging
-    if target.get("filename"):
-        for d in [LORAS_DIR, BASE_DIR / "kaggle_datasets" / "Loras_Manga_Coloring_Anima"]:
-            local_f = d / target["filename"]
-            if local_f.exists():
-                try:
-                    local_f.unlink()
-                except Exception:
-                    pass
-
-    log_message(f"Removed LoRA: {target.get('name')}")
-    return {"status": "deleted", "id": lora_id}
-
-
-@app.post("/api/loras/update")
-def update_lora_endpoint(req: UpdateLoraRequest):
-    """Updates scale and enabled properties of a LoRA in loras.json."""
-    loras = load_loras_config()
-    for l in loras:
-        if l.get("id") == req.id:
-            if req.scale is not None:
-                l["scale"] = req.scale
-            if req.enabled is not None:
-                l["enabled"] = req.enabled
-            save_loras_config(loras)
-            return {"status": "success", "lora": l}
-    raise HTTPException(status_code=404, detail="LoRA not found")
-
-
-@app.get("/api/datasets/status")
-async def get_datasets_status_endpoint():
-    """Checks the status of Models_Manga_Coloring and Loras_Manga_Coloring_Anima on Kaggle."""
-    from scripts.sync_kaggle_datasets import check_dataset_status
-    u = get_kaggle_username()
-    status = await asyncio.to_thread(check_dataset_status, u)
-    return status
-
-
-@app.post("/api/datasets/sync-loras")
-def sync_loras_endpoint(background_tasks: BackgroundTasks):
-    """Synchronizes all local LoRAs to Kaggle dataset in background."""
-    from scripts.sync_kaggle_datasets import sync_loras_dataset
-    u = get_kaggle_username()
-
-    def _sync_worker():
-        log_message(f"Starting Kaggle LoRAs dataset sync (Loras_Manga_Coloring_Anima) for @{u}...")
-        try:
-            sync_loras_dataset(u)
-            log_message("Kaggle LoRAs dataset synchronized successfully!")
-        except Exception as e:
-            log_message(f"LoRA dataset sync error: {e}")
-
-    background_tasks.add_task(_sync_worker)
-    return {"status": "started", "message": "LoRAs synchronization started in background"}
-
-
-@app.post("/api/datasets/sync-models")
-def sync_models_endpoint(background_tasks: BackgroundTasks):
-    """Synchronizes Anima Base model to Kaggle dataset in background."""
-    from scripts.sync_kaggle_datasets import sync_models_dataset
-    u = get_kaggle_username()
-
-    def _sync_worker():
-        log_message(f"Starting Kaggle Model dataset sync (Models_Manga_Coloring) for @{u}...")
-        try:
-            sync_models_dataset(u)
-            log_message("Kaggle Model dataset synchronized successfully!")
-        except Exception as e:
-            log_message(f"Model dataset sync error: {e}")
-
-    background_tasks.add_task(_sync_worker)
-    return {"status": "started", "message": "Model synchronization started in background"}
-
-
 class SaveSettingsRequest(BaseModel):
     kaggle_username: Optional[str] = None
     kaggle_key: Optional[str] = None
@@ -849,32 +349,15 @@ def get_kaggle_api_safe(verify_online: bool = False):
 
 
 def get_kaggle_username() -> str:
-    """Dynamically resolves the authenticated Kaggle username."""
-    api = get_kaggle_api_safe()
-    if api:
-        if hasattr(api, "config_values") and api.config_values.get("username"):
-            return api.config_values["username"]
-        try:
-            val = api.get_config_value("username")
-            if val:
-                return val
-        except Exception:
-            pass
+    """Dynamically resolves the authenticated Kaggle username (raises if not configured)."""
+    return resolve_kaggle_username(get_kaggle_api_safe())
 
-    u = os.getenv("KAGGLE_USERNAME")
-    if u and u != "your_kaggle_username":
-        return u
 
+def require_kaggle_username() -> str:
     try:
-        kjson = Path.home() / ".kaggle" / "kaggle.json"
-        if kjson.exists():
-            data = json.loads(kjson.read_text(encoding="utf-8"))
-            if data.get("username"):
-                return data["username"]
-    except Exception:
-        pass
-
-    return "mobasharulislam"
+        return get_kaggle_username()
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/settings")
@@ -882,7 +365,12 @@ def get_settings_endpoint():
     """Returns the current Kaggle and Hugging Face authentication status."""
     api = get_kaggle_api_safe()
     is_authenticated = api is not None
-    username = get_kaggle_username() if is_authenticated else None
+    username = None
+    if is_authenticated:
+        try:
+            username = get_kaggle_username()
+        except RuntimeError:
+            is_authenticated = False
 
     hf_tok = os.getenv("HF_TOKEN", "")
     return {
@@ -903,6 +391,12 @@ def save_settings_endpoint(req: SaveSettingsRequest):
     key_or_token = req.kaggle_key.strip() if req.kaggle_key else ""
     username = req.kaggle_username.strip() if req.kaggle_username else ""
 
+    if key_or_token and not username:
+        try:
+            username = resolve_kaggle_username()
+        except RuntimeError:
+            raise HTTPException(status_code=400, detail="Please enter your Kaggle username.")
+
     if key_or_token:
         # Clear legacy cached access tokens
         (kaggle_dir / "access_token").unlink(missing_ok=True)
@@ -914,7 +408,7 @@ def save_settings_endpoint(req: SaveSettingsRequest):
             os.environ["KAGGLE_API_TOKEN"] = key_or_token
         
         creds = {
-            "username": username or "rabiulislam5788",
+            "username": username,
             "key": key_or_token
         }
         kaggle_file.write_text(json.dumps(creds, indent=2), encoding="utf-8")
@@ -1024,127 +518,254 @@ async def upload_kaggle_json_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Failed to process kaggle.json: {e}")
 
 
+DATASET_READY_TIMEOUT_S = 600          # Kaggle indexing of a freshly uploaded scans dataset
+KERNEL_TIMEOUT_S = 10 * 3600           # Kaggle TPU sessions are capped at 9 hours
+MAX_STATUS_FAILURES = 8                # consecutive failed `kernels status` calls (~2 minutes)
+
+# Per-chapter layout under output_app/<chapter>/:
+#   input/       original scans, snapshotted when the chapter is colorized
+#   generated/   raw TPU output (edit_<stem>.png)
+#   final/       post-processed pages (lineart blend / bubble restore)
+#   history/     raw outputs replaced by a later re-run, one folder per run
+#   postprocess.json
+
+
+def chapter_dir_for(chapter: str) -> Path:
+    return OUTPUT_DIR / safe_name(chapter)
+
+
+def _sorted_images(folder: Path) -> List[Path]:
+    if not folder.is_dir():
+        return []
+    files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
+    return sorted(files, key=lambda p: natural_key(p.name))
+
+
+def find_original(chapter_dir: Path, color_name: str) -> Optional[Path]:
+    """Original scan for a generated page, from the chapter's input snapshot."""
+    stem = Path(color_name).stem
+    if stem.startswith("edit_"):
+        stem = stem[len("edit_"):]
+    for f in _sorted_images(chapter_dir / "input"):
+        if f.stem == stem:
+            return f
+    return None
+
+
+def load_post_settings(chapter_dir: Path) -> postprocess.PostSettings:
+    try:
+        data = json.loads((chapter_dir / "postprocess.json").read_text(encoding="utf-8"))
+        return postprocess.PostSettings(
+            lineart_strength=float(data.get("lineart_strength", 0.5)),
+            preserve_bubbles=bool(data.get("preserve_bubbles", False)),
+        )
+    except Exception:
+        return postprocess.PostSettings()
+
+
+def postprocess_chapter(chapter_dir: Path, settings: postprocess.PostSettings, only: Optional[List[str]] = None) -> int:
+    """Writes final/<page> for every generated page that has an original scan. Returns the count."""
+    final_dir = chapter_dir / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for color_file in sorted((chapter_dir / "generated").glob("*.png")):
+        if only is not None and color_file.name not in only:
+            continue
+        dst = final_dir / color_file.name
+        original = find_original(chapter_dir, color_file.name)
+        if settings.is_noop or original is None:
+            dst.unlink(missing_ok=True)
+            continue
+        with Image.open(color_file) as color, Image.open(original) as orig:
+            postprocess.apply(color, orig, settings).save(dst)
+        count += 1
+    return count
+
+
+def merge_outputs(chapter_dir: Path, new_files: List[Path]) -> int:
+    """Moves freshly downloaded pages into generated/, backing up any page they replace."""
+    generated = chapter_dir / "generated"
+    generated.mkdir(parents=True, exist_ok=True)
+    history = chapter_dir / "history" / time.strftime("%Y%m%d-%H%M%S")
+    replaced = 0
+    for f in new_files:
+        dst = generated / f.name
+        if dst.exists():
+            history.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dst), str(history / f.name))
+            replaced += 1
+        shutil.move(str(f), str(dst))
+    return replaced
+
+
+def upload_scans_dataset(api, kaggle_user: str, scans: List[Path], chapter_name: str):
+    """Zips the scans into the private scans dataset and waits until Kaggle has indexed it."""
+    import zipfile
+
+    dataset_full_slug = f"{kaggle_user}/{SCANS_DATASET_SLUG}"
+    with state_lock:
+        job_state["phase_message"] = "Packaging & uploading scans to Kaggle..."
+    log_message(f"Packaging {len(scans)} scans for Kaggle dataset '{dataset_full_slug}'...")
+
+    staging_dir = BASE_DIR / "kaggle_datasets" / "input_pages_staging"
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(staging_dir / "scans.zip", "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for scan in scans:
+            zf.write(scan, arcname=scan.name)
+    with open(staging_dir / "dataset-metadata.json", "w", encoding="utf-8") as f:
+        json.dump({"title": SCANS_DATASET_SLUG, "id": dataset_full_slug, "licenses": [{"name": "CC0-1.0"}]}, f)
+
+    existing_datasets = []
+    try:
+        existing_datasets = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=kaggle_user)]
+    except Exception as e:
+        log_message(f"Note checking existing datasets: {e}")
+    dataset_exists = any(dataset_full_slug.lower() == d.lower() for d in existing_datasets)
+
+    if dataset_exists:
+        try:
+            log_message(f"Updating existing Kaggle dataset '{dataset_full_slug}'...")
+            api.dataset_create_version(str(staging_dir), version_notes=f"Chapter: {chapter_name}", dir_mode="zip")
+        except Exception as ver_err:
+            if "403" in str(ver_err) or "404" in str(ver_err) or "not found" in str(ver_err).lower():
+                log_message(f"Version update returned ({ver_err}). Creating new dataset '{dataset_full_slug}'...")
+                api.dataset_create_new(str(staging_dir), dir_mode="zip", public=False, quiet=False)
+            else:
+                raise
+    else:
+        log_message(f"Creating new private Kaggle dataset '{dataset_full_slug}'...")
+        api.dataset_create_new(str(staging_dir), dir_mode="zip", public=False, quiet=False)
+
+    log_message("Kaggle dataset upload submitted. Waiting for Kaggle backend to finish indexing...")
+    with state_lock:
+        job_state["phase_message"] = "Waiting for Kaggle dataset processing..."
+
+    # Poll until Kaggle marks the version ready, so the kernel never mounts the previous scans.
+    poll_interval = 4
+    waited = 0
+    while waited < DATASET_READY_TIMEOUT_S:
+        time.sleep(poll_interval)
+        waited += poll_interval
+        try:
+            ds_status = str(api.dataset_status(dataset_full_slug)).lower()
+        except Exception:
+            continue  # transient status API errors right after upload
+        if "ready" in ds_status:
+            log_message(f"Kaggle dataset '{dataset_full_slug}' is ready! ({waited}s)")
+            return
+        if "error" in ds_status or "fail" in ds_status:
+            raise RuntimeError(f"Kaggle dataset processing failed: {ds_status}")
+        if waited % 12 == 0:
+            log_message(f"Dataset indexing on Kaggle... ({waited}s, status: {ds_status})")
+            with state_lock:
+                job_state["phase_message"] = f"Kaggle indexing dataset ({waited}s)..."
+    raise RuntimeError(
+        f"Kaggle did not finish indexing '{dataset_full_slug}' within {DATASET_READY_TIMEOUT_S // 60} minutes. "
+        "Starting now would colorize the previous scans; please try again in a few minutes."
+    )
+
+
+def monitor_kernel(sys_py: str, kernel_name: str):
+    deadline = time.time() + KERNEL_TIMEOUT_S
+    is_running = False
+    failures = 0
+    while True:
+        time.sleep(15)
+        if time.time() > deadline:
+            raise RuntimeError(f"Kaggle kernel did not finish within {KERNEL_TIMEOUT_S // 3600} hours.")
+        status_res = subprocess.run([sys_py, "-m", "kaggle", "kernels", "status", kernel_name], capture_output=True, text=True, cwd=BASE_DIR)
+        status_text = (status_res.stdout or "").strip()
+
+        with state_lock:
+            job_state["elapsed_seconds"] = int(time.time() - job_state["start_time"])
+            job_state["last_kernel_status"] = status_text
+
+        if status_res.returncode != 0 or not status_text:
+            failures += 1
+            log_message(f"Kernel status check failed ({failures}/{MAX_STATUS_FAILURES}): {(status_res.stderr or '').strip()[:200]}")
+            if failures >= MAX_STATUS_FAILURES:
+                raise RuntimeError("Lost contact with Kaggle while monitoring the kernel. Check the kernel on kaggle.com.")
+            continue
+        failures = 0
+
+        if "QUEUED" in status_text:
+            with state_lock:
+                job_state["status"] = "queued"
+                job_state["phase_message"] = "Queued on Kaggle TPU allocator..."
+            log_message(f"Status: QUEUED ({job_state['elapsed_seconds']}s elapsed)")
+        elif "RUNNING" in status_text:
+            if not is_running:
+                is_running = True
+                log_message("TPU VM Allocated! 8 Cores are initializing & colorizing...")
+            with state_lock:
+                job_state["status"] = "running"
+                job_state["phase_message"] = "8 TPU Cores Generating in Parallel..."
+            log_message(f"Status: RUNNING ({job_state['elapsed_seconds']}s elapsed)")
+        elif "COMPLETE" in status_text:
+            log_message("Kaggle Kernel Completed Successfully!")
+            return
+        elif "ERROR" in status_text or "CANCEL" in status_text:
+            raise RuntimeError(f"Kaggle kernel failed with status: {status_text}")
+
+
 def background_tpu_runner(req: JobStartRequest):
-    """Executes the full pipeline: Notebook Build -> Kaggle Push -> Monitor -> Download."""
+    """Executes the full pipeline: Scans Upload -> Notebook Build -> Kaggle Push -> Monitor -> Download."""
     sys_py = sys.executable
-    kaggle_user = get_kaggle_username()
+    safe_chapter = safe_name(req.chapter_name)
+    chapter_dir = OUTPUT_DIR / safe_chapter
     try:
         with state_lock:
             job_state["status"] = "preparing"
             job_state["phase_message"] = "Generating TPU multi-core notebook..."
+            job_state["chapter_name"] = safe_chapter
             job_state["start_time"] = time.time()
             job_state["error"] = None
             job_state["completed_images"] = 0
             job_state["logs"] = []
 
+        kaggle_user = get_kaggle_username()
+        api = get_kaggle_api_safe()
+        if not api:
+            raise RuntimeError("Kaggle API is not authenticated. Please check your Kaggle API key in Settings.")
+
         log_message("=== Starting Manga Colorization Job ===")
-        log_message(f"User: @{kaggle_user} | Chapter: {req.chapter_name} | Max Dim: {req.max_dim}px | Steps: {req.num_steps}")
+        log_message(f"User: @{kaggle_user} | Chapter: {safe_chapter} | Max Dim: {req.max_dim}px | Steps: {req.num_steps}")
 
-        # 1. If local images or zips exist in INPUT_DIR, package them into a fast single zip and upload to Kaggle dataset
-        image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-        local_scans = [f for f in INPUT_DIR.iterdir() if f.suffix.lower() in image_extensions]
-        local_zips = [f for f in INPUT_DIR.iterdir() if f.suffix.lower() == ".zip"]
+        # 1. Pick the scans: selected pages of an existing chapter, or the whole loaded chapter
+        if req.pages:
+            source_dir = chapter_dir / "input"
+            wanted = sorted({Path(p).name for p in req.pages}, key=natural_key)
+            scans = [source_dir / n for n in wanted if (source_dir / n).is_file()]
+            missing = [n for n in wanted if not (source_dir / n).is_file()]
+            if missing:
+                raise RuntimeError(f"Original scans not found for: {', '.join(missing)}")
+            log_message(f"Re-running {len(scans)} selected page(s): {', '.join(wanted)}")
+        else:
+            scans = _sorted_images(INPUT_DIR)
+            if not scans:
+                raise RuntimeError("No scans loaded. Select a folder or drop a .zip/.cbz first.")
+            snapshot = chapter_dir / "input"
+            shutil.rmtree(snapshot, ignore_errors=True)
+            snapshot.mkdir(parents=True, exist_ok=True)
+            for f in scans:
+                shutil.copy2(f, snapshot / f.name)
 
-        if local_scans or local_zips:
-            with state_lock:
-                job_state["phase_message"] = f"Packaging & uploading scans to Kaggle..."
-            log_message(f"Preparing single fast zip archive for Kaggle dataset '{kaggle_user}/gbd-ch-107-part2'...")
+        with state_lock:
+            job_state["total_images"] = len(scans)
 
-            staging_dir = BASE_DIR / "kaggle_datasets" / "input_pages_staging"
-            staging_dir.mkdir(parents=True, exist_ok=True)
-            for old_f in staging_dir.iterdir():
-                try:
-                    if old_f.is_file():
-                        old_f.unlink()
-                except Exception:
-                    pass
+        upload_scans_dataset(api, kaggle_user, scans, safe_chapter)
 
-            zip_dest = staging_dir / "scans.zip"
-            if local_scans:
-                import zipfile
-                log_message(f"Compressing {len(local_scans)} scans into {zip_dest.name}...")
-                with zipfile.ZipFile(zip_dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    for scan in sorted(local_scans):
-                        zf.write(scan, arcname=scan.name)
-            elif local_zips:
-                import shutil
-                shutil.copy2(local_zips[0], zip_dest)
-
-            dataset_slug = "gbd-ch-107-part2"
-            dataset_full_slug = f"{kaggle_user}/{dataset_slug}"
-
-            meta = {
-                "title": dataset_slug,
-                "id": dataset_full_slug,
-                "licenses": [{"name": "CC0-1.0"}]
-            }
-            with open(staging_dir / "dataset-metadata.json", "w", encoding="utf-8") as f:
-                json.dump(meta, f)
-
-            api = get_kaggle_api_safe()
-            if not api:
-                raise RuntimeError("Kaggle API is not authenticated. Please check your Kaggle API key in Settings.")
-
-            # Check if dataset exists on Kaggle under this user
-            existing_datasets = []
-            try:
-                existing_datasets = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=kaggle_user)]
-            except Exception as e:
-                log_message(f"Note checking existing datasets: {e}")
-
-            dataset_exists = any(dataset_full_slug.lower() == d.lower() or dataset_slug.lower() == d.split("/")[-1].lower() for d in existing_datasets)
-
-            if dataset_exists:
-                try:
-                    log_message(f"Updating existing Kaggle dataset '{dataset_full_slug}'...")
-                    api.dataset_create_version(str(staging_dir), version_notes=f"Chapter: {req.chapter_name}", dir_mode="zip")
-                except Exception as ver_err:
-                    if "403" in str(ver_err) or "404" in str(ver_err) or "not found" in str(ver_err).lower():
-                        log_message(f"Version update returned ({ver_err}). Creating new dataset '{dataset_full_slug}'...")
-                        api.dataset_create_new(str(staging_dir), dir_mode="zip", public=False, quiet=False)
-                    else:
-                        raise
-            else:
-                log_message(f"Creating new private Kaggle dataset '{dataset_full_slug}'...")
-                api.dataset_create_new(str(staging_dir), dir_mode="zip", public=False, quiet=False)
-
-            log_message("Kaggle dataset upload submitted. Waiting for Kaggle backend to finish indexing...")
-            with state_lock:
-                job_state["phase_message"] = "Waiting for Kaggle dataset processing..."
-            
-            # Poll until Kaggle marks dataset version as 'ready' (preventing kernel mounting stale previous version)
-            dataset_full_slug = f"{kaggle_user}/gbd-ch-107-part2"
-            max_wait_seconds = 600  # 10 minutes max for massive datasets
-            poll_interval = 4
-            waited = 0
-            while waited < max_wait_seconds:
-                time.sleep(poll_interval)
-                waited += poll_interval
-                try:
-                    ds_status = str(api.dataset_status(dataset_full_slug)).lower()
-                    if "ready" in ds_status:
-                        log_message(f"Kaggle dataset '{dataset_full_slug}' is ready! ({waited}s)")
-                        break
-                    elif "error" in ds_status or "fail" in ds_status:
-                        raise RuntimeError(f"Kaggle dataset processing failed: {ds_status}")
-                    else:
-                        if waited % 12 == 0:
-                            log_message(f"Dataset indexing on Kaggle... ({waited}s, status: {ds_status})")
-                            with state_lock:
-                                job_state["phase_message"] = f"Kaggle indexing dataset ({waited}s)..."
-                except Exception as poll_err:
-                    if "processing failed" in str(poll_err):
-                        raise
-                    # Ignore transient status API errors during initial upload window
-                    pass
-            log_message("Kaggle dataset version confirmed ready.")
-
-        # 2. Build lightweight notebook with user selected LoRAs & settings
+        # 2. Build lightweight notebook with the library's model, enabled LoRAs & settings
         from scripts.make_notebook import build_notebook
-        lora_dicts = [lora.dict() for lora in req.loras] if req.loras else None
+        spec = library.run_spec()
+        log_message(f"Model: {spec['model']['name']} ({'cached dataset' if spec['model']['dataset'] else 'download from Hugging Face'})")
+        for l in spec["loras"]:
+            log_message(f"LoRA: {l['name']} @ {l['scale']:.2f} ({'cached dataset' if l['dataset'] else 'download'})")
         build_notebook(
             input_dir=str(INPUT_DIR),
-            loras=lora_dicts,
+            model=spec["model"],
+            loras=spec["loras"],
             max_dim=req.max_dim,
             num_steps=req.num_steps,
             guidance_scale=req.guidance_scale,
@@ -1165,69 +786,48 @@ def background_tpu_runner(req: JobStartRequest):
         if push_res.returncode != 0:
             raise RuntimeError(f"Kaggle push failed: {push_res.stderr}")
 
-        # 3. Monitor Kaggle Kernel execution
-        kernel_name = f"{kaggle_user}/tpu-image-generation-anima-base-1-0-2b"
-        is_running = False
+        # 4. Monitor Kaggle Kernel execution
+        monitor_kernel(sys_py, f"{kaggle_user}/{KERNEL_SLUG}")
 
-        while True:
-            time.sleep(15)
-            status_res = subprocess.run([sys_py, "-m", "kaggle", "kernels", "status", kernel_name], capture_output=True, text=True, cwd=BASE_DIR)
-            status_text = status_res.stdout.strip()
-            
-            with state_lock:
-                job_state["elapsed_seconds"] = int(time.time() - job_state["start_time"])
-                job_state["last_kernel_status"] = status_text
-
-            if "QUEUED" in status_text:
-                with state_lock:
-                    job_state["status"] = "queued"
-                    job_state["phase_message"] = "Queued on Kaggle TPU allocator..."
-                log_message(f"Status: QUEUED ({job_state['elapsed_seconds']}s elapsed)")
-            elif "RUNNING" in status_text:
-                if not is_running:
-                    is_running = True
-                    log_message("TPU VM Allocated! 8 Cores are initializing & colorizing...")
-                with state_lock:
-                    job_state["status"] = "running"
-                    job_state["phase_message"] = "8 TPU Cores Generating in Parallel..."
-                log_message(f"Status: RUNNING ({job_state['elapsed_seconds']}s elapsed)")
-            elif "COMPLETE" in status_text:
-                log_message("Kaggle Kernel Completed Successfully!")
-                break
-            elif "ERROR" in status_text or "CANCELLED" in status_text:
-                raise RuntimeError(f"Kaggle kernel failed with status: {status_text}")
-
-        # 4. Download Results
-        safe_chapter = re.sub(r'[^\w\-_.]', '_', req.chapter_name)
-        chapter_out = OUTPUT_DIR / safe_chapter
-        chapter_out.mkdir(parents=True, exist_ok=True)
-
+        # 5. Download results into a scratch folder, then merge into the chapter
         with state_lock:
             job_state["status"] = "downloading"
             job_state["phase_message"] = "Downloading finished high-res color images..."
-        log_message(f"Downloading outputs to {chapter_out}...")
+        download_dir = chapter_dir / "_download"
+        shutil.rmtree(download_dir, ignore_errors=True)
+        log_message(f"Downloading outputs to {chapter_dir}...")
 
-        dl_res = subprocess.run([sys_py, str(SCRIPTS_DIR / "download_fixed.py"), str(chapter_out), kaggle_user], capture_output=True, text=True, cwd=BASE_DIR)
-        log_message(dl_res.stdout[-300:] if dl_res.stdout else "Downloaded successfully.")
+        dl_res = subprocess.run([sys_py, str(SCRIPTS_DIR / "download_fixed.py"), str(download_dir), kaggle_user], capture_output=True, text=True, cwd=BASE_DIR)
+        if dl_res.stdout:
+            log_message(dl_res.stdout[-300:])
+        if dl_res.returncode != 0:
+            raise RuntimeError(f"Downloading results failed: {(dl_res.stderr or '').strip()[-500:]}")
 
-        # 5. Populate Output Results
-        generated_dir = chapter_out / "generated"
-        out_files = []
-        if generated_dir.exists():
-            for f in sorted(glob.glob(str(generated_dir / "*.png"))):
-                out_files.append({
-                    "name": Path(f).name,
-                    "path": f,
-                    "url": f"/api/image/output/{safe_chapter}/{Path(f).name}"
-                })
+        for log_file in download_dir.glob("*.log"):
+            shutil.copy2(log_file, chapter_dir / log_file.name)
+        new_files = sorted((download_dir / "generated").glob("*.png"))
+        if not new_files:
+            raise RuntimeError(f"The kernel finished but produced no images. See the logs in {chapter_dir}.")
+        replaced = merge_outputs(chapter_dir, new_files)
+        shutil.rmtree(download_dir, ignore_errors=True)
+        if replaced:
+            log_message(f"Previous versions of {replaced} page(s) saved under {chapter_dir / 'history'}.")
+        if len(new_files) < len(scans):
+            log_message(f"WARNING: only {len(new_files)} of {len(scans)} pages came back. Re-run the missing pages from the gallery.")
+
+        # 6. Post-process the new pages with the chapter's settings
+        new_names = [f.name for f in new_files]
+        with state_lock:
+            job_state["phase_message"] = "Restoring lineart & speech bubbles..."
+        postprocess_chapter(chapter_dir, load_post_settings(chapter_dir), only=new_names)
 
         with state_lock:
             job_state["status"] = "completed"
             job_state["phase_message"] = "Colorization Complete!"
-            job_state["completed_images"] = len(out_files)
-            job_state["output_images"] = out_files
+            job_state["completed_images"] = len(new_files)
+            job_state["output_images"] = new_names
 
-        log_message(f"SUCCESS: Generated {len(out_files)} colorized pages in {job_state['elapsed_seconds']}s total!")
+        log_message(f"SUCCESS: Generated {len(new_files)} colorized pages in {job_state['elapsed_seconds']}s total!")
 
     except Exception as e:
         err_msg = str(e)
@@ -1240,9 +840,16 @@ def background_tpu_runner(req: JobStartRequest):
 
 @app.post("/api/start")
 def start_colorization_job(req: JobStartRequest, background_tasks: BackgroundTasks):
+    try:
+        library.run_spec()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     with state_lock:
         if job_state["status"] in ["preparing", "pushing", "queued", "running", "downloading"]:
             raise HTTPException(status_code=400, detail="A colorization job is already in progress.")
+        # Claim the slot now so a double click cannot start two jobs.
+        job_state["status"] = "preparing"
+        job_state["start_time"] = time.time()
 
     background_tasks.add_task(background_tpu_runner, req)
     return {"status": "started", "chapter": req.chapter_name}
@@ -1256,6 +863,34 @@ def get_job_status():
         return dict(job_state)
 
 
+def _legacy_input_url(color_file: Path, idx: int, input_files: List[Path]) -> Optional[str]:
+    """Best-effort match against input_pages/ for chapters colorized before input snapshots existed."""
+    input_map = {}
+    for p_path in input_files:
+        input_map[p_path.stem] = p_path.name
+        num_match = re.search(r'\d+', p_path.stem)
+        if num_match:
+            num_str = num_match.group(0)
+            input_map[num_str.lstrip("0") or "0"] = p_path.name
+            input_map[f"{int(num_str):02d}"] = p_path.name
+
+    stem = color_file.stem
+    clean_stem = stem.replace("edit_", "").replace("color_", "").replace("out_", "")
+    if clean_stem in input_map:
+        return f"/api/image/input/{input_map[clean_stem]}"
+    if stem in input_map:
+        return f"/api/image/input/{input_map[stem]}"
+    num_match = re.search(r'\d+', clean_stem)
+    if num_match and (num_match.group(0).lstrip("0") or "0") in input_map:
+        return f"/api/image/input/{input_map[num_match.group(0).lstrip('0') or '0']}"
+    for in_stem, in_name in input_map.items():
+        if in_stem == clean_stem or in_stem.startswith(clean_stem) or clean_stem.startswith(in_stem):
+            return f"/api/image/input/{in_name}"
+    if idx < len(input_files):
+        return f"/api/image/input/{input_files[idx].name}"
+    return None
+
+
 @app.get("/api/results")
 def get_results(chapter: Optional[str] = None):
     # Discover all available chapters in output_app
@@ -1264,9 +899,7 @@ def get_results(chapter: Optional[str] = None):
         for ch_dir in OUTPUT_DIR.iterdir():
             if ch_dir.is_dir() and (ch_dir / "generated").exists() and list((ch_dir / "generated").glob("*.png")):
                 available_chapters.append(ch_dir.name)
-
-    # Sort chapters naturally
-    available_chapters.sort(key=lambda c: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', c)])
+    available_chapters.sort(key=natural_key)
 
     # Pick requested chapter, or current job chapter, or first available chapter
     selected_chapter = chapter
@@ -1279,80 +912,119 @@ def get_results(chapter: Optional[str] = None):
         else:
             selected_chapter = "Chapter_1"
 
-    safe_chapter = re.sub(r'[^\w\-_.]', '_', selected_chapter)
-    generated_dir = OUTPUT_DIR / safe_chapter / "generated"
+    safe_chapter = safe_name(selected_chapter)
+    chapter_dir = OUTPUT_DIR / safe_chapter
+    generated_dir = chapter_dir / "generated"
+    has_snapshot = (chapter_dir / "input").is_dir()
+    legacy_inputs = [] if has_snapshot else _sorted_images(INPUT_DIR)
 
     pairs = []
-    if generated_dir.exists():
-        input_files = sorted(glob.glob(str(INPUT_DIR / "*")), key=lambda p: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', Path(p).name)])
-        input_map = {}
-        for p in input_files:
-            p_path = Path(p)
-            if p_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
-                input_map[p_path.stem] = p_path.name
-                num_match = re.search(r'\d+', p_path.stem)
-                if num_match:
-                    num_str = num_match.group(0)
-                    input_map[num_str.lstrip("0") or "0"] = p_path.name
-                    input_map[f"{int(num_str):02d}"] = p_path.name
-        
-        color_files = sorted(glob.glob(str(generated_dir / "*.png")), key=lambda p: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', Path(p).name)])
+    color_files = sorted(generated_dir.glob("*.png"), key=lambda p: natural_key(p.name)) if generated_dir.exists() else []
+    for idx, color_file in enumerate(color_files):
+        name = color_file.name
+        final_file = chapter_dir / "final" / name
+        shown = final_file if final_file.exists() else color_file
+        kind = "final" if shown is final_file else "generated"
+        version = int(shown.stat().st_mtime)
 
-        for idx, color_file in enumerate(color_files):
-            color_filename = Path(color_file).name
-            stem = Path(color_file).stem
-            clean_stem = stem.replace("edit_", "").replace("color_", "").replace("out_", "")
+        original = find_original(chapter_dir, name) if has_snapshot else None
+        if original is not None:
+            input_url = f"/api/image/chapter/{safe_chapter}/input/{original.name}"
+        else:
+            input_url = _legacy_input_url(color_file, idx, legacy_inputs)
 
-            input_url = None
-            if clean_stem in input_map:
-                input_url = f"/api/image/input/{input_map[clean_stem]}"
-            elif stem in input_map:
-                input_url = f"/api/image/input/{input_map[stem]}"
-            else:
-                num_match = re.search(r'\d+', clean_stem)
-                if num_match and (num_match.group(0).lstrip("0") or "0") in input_map:
-                    input_url = f"/api/image/input/{input_map[num_match.group(0).lstrip('0') or '0']}"
-                else:
-                    for in_stem, in_name in input_map.items():
-                        if in_stem == clean_stem or in_stem.startswith(clean_stem) or clean_stem.startswith(in_stem):
-                            input_url = f"/api/image/input/{in_name}"
-                            break
-                if not input_url and idx < len(input_files):
-                    input_url = f"/api/image/input/{Path(input_files[idx]).name}"
+        pairs.append({
+            "id": color_file.stem.replace("edit_", ""),
+            "color_name": name,
+            "color_url": f"/api/image/chapter/{safe_chapter}/{kind}/{name}?v={version}",
+            "raw_url": f"/api/image/chapter/{safe_chapter}/generated/{name}?v={int(color_file.stat().st_mtime)}",
+            "input_url": input_url or f"/api/image/chapter/{safe_chapter}/generated/{name}",
+            # Original scan name, needed to re-run this page; None for legacy chapters.
+            "page": original.name if original is not None else None,
+        })
 
-            pairs.append({
-                "id": clean_stem,
-                "color_name": color_filename,
-                "color_url": f"/api/image/output/{safe_chapter}/{color_filename}",
-                "input_url": input_url or f"/api/image/output/{safe_chapter}/{color_filename}",
-            })
-
+    settings = load_post_settings(chapter_dir)
     return {
         "chapter_name": safe_chapter,
         "available_chapters": available_chapters,
         "count": len(pairs),
-        "pairs": pairs
+        "pairs": pairs,
+        "can_postprocess": has_snapshot,
+        "postprocess": {"lineart_strength": settings.lineart_strength, "preserve_bubbles": settings.preserve_bubbles},
     }
+
+
+class PostprocessRequest(BaseModel):
+    chapter: str
+    lineart_strength: float = 0.5
+    preserve_bubbles: bool = False
+
+
+@app.post("/api/postprocess")
+async def postprocess_endpoint(req: PostprocessRequest):
+    """Saves a chapter's post-processing settings and re-renders all its final pages."""
+    chapter_dir = chapter_dir_for(req.chapter)
+    if not (chapter_dir / "generated").is_dir():
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    if not (chapter_dir / "input").is_dir():
+        raise HTTPException(status_code=400, detail="This chapter was colorized before original scans were kept, so it cannot be post-processed.")
+    settings = postprocess.PostSettings(
+        lineart_strength=max(0.0, min(1.0, req.lineart_strength)),
+        preserve_bubbles=req.preserve_bubbles,
+    )
+    (chapter_dir / "postprocess.json").write_text(
+        json.dumps({"lineart_strength": settings.lineart_strength, "preserve_bubbles": settings.preserve_bubbles}, indent=2),
+        encoding="utf-8",
+    )
+    count = await asyncio.to_thread(postprocess_chapter, chapter_dir, settings)
+    log_message(f"Post-processed {count} pages of '{chapter_dir.name}' (lineart {settings.lineart_strength:.2f}, bubbles {'on' if settings.preserve_bubbles else 'off'}).")
+    return {"status": "success", "count": count}
+
+
+@app.get("/api/image/preview/{chapter}/{filename}")
+def preview_postprocess(chapter: str, filename: str, lineart: float = 0.5, bubbles: bool = False):
+    """Renders one page with the given settings without saving, for live slider previews."""
+    chapter_dir = chapter_dir_for(chapter)
+    name = Path(filename).name
+    color_file = chapter_dir / "generated" / name
+    original = find_original(chapter_dir, name)
+    if not color_file.exists() or original is None:
+        raise HTTPException(status_code=404, detail="Page not found")
+    settings = postprocess.PostSettings(lineart_strength=max(0.0, min(1.0, lineart)), preserve_bubbles=bubbles)
+    with Image.open(color_file) as color, Image.open(original) as orig:
+        out = postprocess.apply(color, orig, settings)
+    buf = io.BytesIO()
+    out.convert("RGB").save(buf, format="JPEG", quality=92)
+    return Response(content=buf.getvalue(), media_type="image/jpeg")
+
+
+@app.get("/api/image/chapter/{chapter}/{kind}/{filename}")
+def get_chapter_image(chapter: str, kind: str, filename: str):
+    if kind not in {"input", "generated", "final"}:
+        raise HTTPException(status_code=404, detail="Unknown image kind")
+    file_path = chapter_dir_for(chapter) / kind / Path(filename).name
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(str(file_path))
 
 
 @app.get("/api/image/input/{filename:path}")
 def get_input_image(filename: str):
-    base_name = Path(filename).name
-    file_path = INPUT_DIR / base_name
-    if not file_path.exists():
-        file_path = INPUT_DIR / filename
-    if not file_path.exists():
+    # Only plain file names inside input_pages/; never resolve '..' or subpaths.
+    file_path = INPUT_DIR / Path(filename).name
+    if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Input image not found")
     return FileResponse(str(file_path))
 
 
 @app.get("/api/image/output/{chapter}/{filename}")
 def get_output_image(chapter: str, filename: str):
-    safe_chapter = re.sub(r'[^\w\-_.]', '_', chapter)
-    file_path = OUTPUT_DIR / safe_chapter / "generated" / filename
+    safe_chapter = safe_name(chapter)
+    name = Path(filename).name
+    file_path = OUTPUT_DIR / safe_chapter / "generated" / name
     if not file_path.exists():
         # Fallback check in out_v31
-        alt_path = BASE_DIR / "output_anima" / safe_chapter / "generated" / filename
+        alt_path = BASE_DIR / "output_anima" / safe_chapter / "generated" / name
         if alt_path.exists():
             return FileResponse(str(alt_path))
         raise HTTPException(status_code=404, detail="Output image not found")
@@ -1361,11 +1033,13 @@ def get_output_image(chapter: str, filename: str):
 
 @app.post("/api/open-folder")
 def open_output_folder(chapter_name: Optional[str] = None):
-    chapter = chapter_name or job_state.get("chapter_name", "chapter_01")
-    safe_chapter = re.sub(r'[^\w\-_.]', '_', str(chapter))
-    target_dir = OUTPUT_DIR / safe_chapter / "generated"
-    if not target_dir.exists():
-        target_dir = OUTPUT_DIR
+    chapter_dir = chapter_dir_for(chapter_name or job_state.get("chapter_name", "chapter_01"))
+    target_dir = OUTPUT_DIR
+    for sub in ("final", "generated"):
+        candidate = chapter_dir / sub
+        if candidate.is_dir() and any(candidate.iterdir()):
+            target_dir = candidate
+            break
     target_dir.mkdir(parents=True, exist_ok=True)
 
     if os.name == "nt":
@@ -1377,5 +1051,8 @@ def open_output_folder(chapter_name: Optional[str] = None):
     return {"status": "opened", "path": str(target_dir)}
 
 
-# Mount static web directory
+library.init(log_message, get_kaggle_api_safe)
+app.include_router(library.router)
+
+# Mount static web directory (last, so it never shadows the API routes)
 app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")

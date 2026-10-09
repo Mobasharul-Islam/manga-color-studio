@@ -11,12 +11,17 @@ from dotenv import load_dotenv
 
 # Root paths
 BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 load_dotenv(BASE_DIR / ".env")
+
+from scripts.common import KERNEL_SLUG, SCANS_DATASET_SLUG, resolve_kaggle_username
 
 
 def build_notebook(
     input_dir: Optional[str] = None,
     loras: Optional[List[Dict[str, Any]]] = None,
+    model: Optional[Dict[str, Any]] = None,
     max_dim: int = 1440,
     num_steps: int = 8,
     guidance_scale: float = 1.0,
@@ -95,103 +100,42 @@ def build_notebook(
         ]
     })
 
-    # Build LoRA fusion lines for tpu_worker.py
+    # The app passes the model & LoRAs selected in its library; standalone runs use the defaults.
+    if model is None:
+        model = {"name": "Anima Base 1.0 (2B)", "source": "circlestone-labs/Anima-Base-v1.0-Diffusers", "revision": None, "dataset": None}
     if loras is None:
-        loras_file = BASE_DIR / "loras.json"
-        if loras_file.exists():
-            try:
-                with open(loras_file, "r", encoding="utf-8") as f:
-                    loras = json.load(f).get("loras", [])
-            except Exception:
-                loras = None
-        if not loras:
-            loras = [
-                {"name": "Color Manga Anima", "path": "Kutches/Anim4/colorMangaAnima.safetensors", "scale": 1.0, "enabled": True},
-                {"name": "Anima Turbo", "path": "circlestone-labs/Anima-Official-LoRAs/anima-turbo-lora-v0.2.safetensors", "scale": 1.0, "enabled": True}
-            ]
+        loras = [
+            {"name": "Color Manga Anima", "path": "Kutches/Anim4/colorMangaAnima.safetensors", "scale": 1.0, "enabled": True, "dataset": None},
+            {"name": "Anima Turbo", "path": "circlestone-labs/Anima-Official-LoRAs/anima-turbo-lora-v0.2.safetensors", "scale": 1.0, "enabled": True, "dataset": None},
+        ]
+    loras = [l for l in loras if l.get("enabled", True) and l.get("path")]
 
-    lora_code_lines = []
-    for lora in loras:
-        if not lora.get("enabled", True):
-            continue
-        p = lora.get("path", "")
-        s = float(lora.get("scale", 1.0))
-        if p:
-            lora_code_lines.append(f"    add_lora({repr(p)}, scale={s}, transformer=pipe.transformer)")
-
+    # Build LoRA fusion lines for tpu_worker.py
+    lora_code_lines = [
+        f"    add_lora({repr(l['path'])}, scale={float(l.get('scale', 1.0))}, transformer=pipe.transformer)"
+        for l in loras
+    ]
     lora_fusion_block = "\n".join(lora_code_lines) if lora_code_lines else "    pass"
+    lora_paths = [l["path"] for l in loras]
 
-    # Determine active Kaggle credentials for cloud auto-caching
-    kuser = None
-    kkey = ""
-    ktoken = ""
+    # Only the username is embedded in the notebook; no keys or tokens.
+    api = None
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
         api = KaggleApi()
         api.authenticate()
-        if hasattr(api, "config_values") and api.config_values.get("username"):
-            kuser = api.config_values.get("username")
-            kkey = api.config_values.get("key") or ""
-            ktoken = api.config_values.get("api_token") or api.config_values.get("token") or ""
-        elif api.get_config_value("username"):
-            kuser = api.get_config_value("username")
-            kkey = api.get_config_value("key") or ""
     except Exception:
-        pass
+        api = None
+    kuser = resolve_kaggle_username(api)
 
-    if not ktoken:
-        ktoken = os.getenv("KAGGLE_API_TOKEN", "")
-        if not ktoken:
-            acc_tok_path = Path.home() / ".kaggle" / "access_token"
-            if acc_tok_path.exists():
-                try:
-                    ktoken = acc_tok_path.read_text(encoding="utf-8").strip()
-                except Exception:
-                    pass
-
-    if not kuser or kuser == "your_kaggle_username":
-        u = os.getenv("KAGGLE_USERNAME")
-        if u and u != "your_kaggle_username":
-            kuser = u
-        kkey = kkey or os.getenv("KAGGLE_KEY", "")
-
-    if not kuser or not kkey:
-        try:
-            kjson = Path.home() / ".kaggle" / "kaggle.json"
-            if kjson.exists():
-                kdata = json.loads(kjson.read_text(encoding="utf-8"))
-                kuser = kuser or kdata.get("username")
-                kkey = kkey or kdata.get("key", "")
-        except Exception:
-            pass
-
-    kuser = kuser or "mobasharulislam"
-    kkey = kkey or ""
-    ktoken = ktoken or ""
-    hf_token_val = os.getenv("HF_TOKEN", "")
-
-    # Resolve dataset IDs
-    scan_dataset_id = f"{kuser}/gbd-ch-107-part2"
-    data_sources = [{"datasetId": scan_dataset_id, "sourceType": "dataset"}]
-    dataset_sources_list = [scan_dataset_id]
-
-    try:
-        from kaggle.api.kaggle_api_extended import KaggleApi
-        api = KaggleApi()
-        api.authenticate()
-        user_ds = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=kuser)]
-        
-        if any("models-manga-coloring" in d.lower() for d in user_ds):
-            user_model_id = f"{kuser}/models-manga-coloring"
-            data_sources.append({"datasetId": user_model_id, "sourceType": "dataset"})
-            dataset_sources_list.append(user_model_id)
-            
-        if any("loras-manga-coloring-anima" in d.lower() for d in user_ds):
-            user_lora_id = f"{kuser}/loras-manga-coloring-anima"
-            data_sources.append({"datasetId": user_lora_id, "sourceType": "dataset"})
-            dataset_sources_list.append(user_lora_id)
-    except Exception:
-        pass
+    # Mount the scans, the selected model's dataset and the datasets of the enabled LoRAs.
+    dataset_sources_list = [f"{kuser}/{SCANS_DATASET_SLUG}"]
+    for ref in [model.get("dataset")] + [l.get("dataset") for l in loras]:
+        if ref and ref not in dataset_sources_list:
+            dataset_sources_list.append(ref)
+    data_sources = [{"datasetId": ref, "sourceType": "dataset"} for ref in dataset_sources_list]
+    model_repo = model["source"]
+    model_revision = model.get("revision") or "main"
 
     # Cell 3: Pre-download & Cache
     cell3_lines = f'''import faulthandler
@@ -214,43 +158,49 @@ from safetensors.torch import load_file
 
 faulthandler.enable()
 
-# Setup Kaggle credentials inside Kaggle notebook for cloud auto-caching
-try:
-    kdir = Path('/root/.kaggle')
-    kdir.mkdir(parents=True, exist_ok=True)
-    if {repr(ktoken)}:
-        (kdir / 'access_token').write_text({repr(ktoken)}, encoding='utf-8')
-        try:
-            os.chmod(str(kdir / 'access_token'), 0o600)
-        except Exception:
-            pass
-        os.environ['KAGGLE_API_TOKEN'] = {repr(ktoken)}
-    if {repr(kuser)} and {repr(kkey)}:
-        kjson = {{"username": {repr(kuser)}, "key": {repr(kkey)}}}
-        (kdir / 'kaggle.json').write_text(json.dumps(kjson, indent=2), encoding='utf-8')
-        try:
-            os.chmod(str(kdir / 'kaggle.json'), 0o600)
-        except Exception:
-            pass
-        os.environ['KAGGLE_USERNAME'] = {repr(kuser)}
-        os.environ['KAGGLE_KEY'] = {repr(kkey)}
-except Exception:
-    pass
+# The optional HF_TOKEN comes from Kaggle Secrets (notebook editor -> Add-ons -> Secrets),
+# never from the notebook source. It only speeds up Hugging Face downloads.
+def _secret(name):
+    try:
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret(name) or ''
+    except Exception:
+        return ''
 
-def find_local_model():
-    if os.path.exists('/kaggle/input'):
-        for root, dirs, files in os.walk('/kaggle/input'):
-            if 'model_index.json' in files:
-                return root
+
+HF_TOKEN = os.getenv('HF_TOKEN') or _secret('HF_TOKEN')
+MODEL_REPO = {repr(model_repo)}
+MODEL_REVISION = {repr(model_revision)}
+LOCAL_MODEL_DIR = '/tmp/mcs_model'
+
+
+def prepare_local_model():
+    """Finds the mounted model dataset and makes it loadable without network access.
+
+    modular_model_index.json names each component's source repo, so the dataset copy would
+    still be fetched from Hugging Face. A rewritten index in /tmp points every component at
+    the mounted folder instead.
+    """
+    if not os.path.exists('/kaggle/input'):
+        return None
+    for root, dirs, files in os.walk('/kaggle/input'):
+        if 'modular_model_index.json' in files:
+            idx = json.load(open(os.path.join(root, 'modular_model_index.json')))
+            for spec in idx.values():
+                if isinstance(spec, list) and len(spec) == 3 and isinstance(spec[2], dict) and 'pretrained_model_name_or_path' in spec[2]:
+                    spec[2]['pretrained_model_name_or_path'] = root
+                    spec[2]['revision'] = None
+            os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
+            with open(os.path.join(LOCAL_MODEL_DIR, 'modular_model_index.json'), 'w') as f:
+                json.dump(idx, f, indent=2)
+            return LOCAL_MODEL_DIR
+        if 'model_index.json' in files:
+            return root
     return None
 
-LOCAL_MODEL = find_local_model()
-MODEL_ID = LOCAL_MODEL if LOCAL_MODEL else 'circlestone-labs/Anima-Base-v1.0-Diffusers'
-MANGA_LORA_REPO = 'Kutches/Anim4'
-MANGA_LORA_FILE = 'colorMangaAnima.safetensors'
-TURBO_LORA_REPO = 'circlestone-labs/Anima-Official-LoRAs'
-TURBO_LORA_FILE = 'anima-turbo-lora-v0.2.safetensors'
-HF_TOKEN = {repr(hf_token_val)} or os.getenv('HF_TOKEN', '')
+
+LOCAL_MODEL = prepare_local_model()
+MODEL_ID = LOCAL_MODEL if LOCAL_MODEL else MODEL_REPO
 
 if HF_TOKEN:
     os.environ['HF_TOKEN'] = HF_TOKEN
@@ -282,14 +232,14 @@ def mark(stage):
     _LOG.flush()
 
 
-REPO_CACHE = Path(os.environ['HF_HOME']) / 'hub' / ('models--' + ('circlestone-labs--Anima-Base-v1.0-Diffusers' if not LOCAL_MODEL else 'local'))
+REPO_CACHE = Path(os.environ['HF_HOME']) / 'hub' / ('models--' + MODEL_REPO.replace('/', '--'))
 BLOBS = REPO_CACHE / 'blobs'
 
 
 def repo_files():
     if LOCAL_MODEL:
         return {{}}
-    url = 'https://huggingface.co/api/models/%s?blobs=true' % MODEL_ID
+    url = 'https://huggingface.co/api/models/%s/revision/%s?blobs=true' % (MODEL_REPO, MODEL_REVISION)
     with urllib.request.urlopen(url, timeout=30) as r:
         data = json.loads(r.read().decode())
     skip = {{'README.md', 'LICENSE.md', '.gitattributes'}}
@@ -300,7 +250,7 @@ def preflight(files):
     if not files:
         return files
     big = max(files, key=lambda k: files[k])
-    url = 'https://huggingface.co/%s/resolve/main/%s' % (MODEL_ID, big)
+    url = 'https://huggingface.co/%s/resolve/%s/%s' % (MODEL_REPO, MODEL_REVISION, big)
     req = urllib.request.Request(url, headers={{'User-Agent': 'Mozilla/5.0',
                                                'Range': 'bytes=0-%d' % (8 * 1024 * 1024 - 1)}})
     t0 = time.time()
@@ -345,11 +295,11 @@ def _incomplete_bytes():
     return total
 
 
-def _dl_subprocess(filename, size, repo=MODEL_ID):
+def _dl_subprocess(filename, size, repo=MODEL_REPO, revision=MODEL_REVISION):
     code = (
         "import os; " + (("os.environ['HF_TOKEN']=%r; " % HF_TOKEN) if HF_TOKEN else "") +
         "from huggingface_hub import hf_hub_download; "
-        "p = hf_hub_download(%r, %r); print('OK', p)" % (repo, filename)
+        "p = hf_hub_download(%r, %r, revision=%r); print('OK', p)" % (repo, filename, revision)
     )
     if size < 50 * 1024 * 1024:
         timeout = 300
@@ -384,7 +334,7 @@ def _dl_subprocess(filename, size, repo=MODEL_ID):
     return ok
 
 
-def download_file_safe(filename, size, repo=MODEL_ID, max_retries=4):
+def download_file_safe(filename, size, repo=MODEL_REPO, max_retries=4):
     for attempt in range(1, max_retries + 1):
         mark('downloading %s (attempt %d/%d)...' % (filename, attempt, max_retries))
         if _dl_subprocess(filename, size, repo):
@@ -394,93 +344,7 @@ def download_file_safe(filename, size, repo=MODEL_ID, max_retries=4):
     return False
 
 
-CACHE_THREAD = None
-
-
-def auto_cache_to_kaggle_datasets():
-    """Background task: Uploads downloaded LoRAs & model directly to Kaggle Datasets for 0-second boot on future runs."""
-    try:
-        try:
-            from kaggle.api.kaggle_api_extended import KaggleApi
-        except ImportError:
-            subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'kaggle'], check=False)
-            from kaggle.api.kaggle_api_extended import KaggleApi
-
-        api = KaggleApi()
-        api.authenticate()
-        u = getattr(api, "config_values", {{}}).get("username") or getattr(api, "_config_values", {{}}).get("username") or os.getenv("KAGGLE_USERNAME") or {repr(kuser)}
-        if not u:
-            return
-
-        user_datasets = [getattr(d, "ref", "") or getattr(d, "id", "") for d in api.dataset_list(user=u)]
-        import shutil
-
-        # 1. Cache LoRAs FIRST (Fast ~150MB, takes <10s)
-        lora_slug = f"{{u}}/loras-manga-coloring-anima"
-        if not any("loras-manga-coloring-anima" in d.lower() for d in user_datasets):
-            lora_staging = Path('/kaggle/working/loras_staging')
-            if lora_staging.exists():
-                shutil.rmtree(lora_staging, ignore_errors=True)
-            lora_staging.mkdir(parents=True, exist_ok=True)
-
-            for p in Path(os.environ['HF_HOME']).rglob('*.safetensors'):
-                shutil.copy2(p, lora_staging / p.name)
-
-            lora_files = list(lora_staging.glob('*.safetensors'))
-            if lora_files:
-                mark('[Cloud-Cache] Packaging LoRAs into private Kaggle dataset (%s)...' % lora_slug)
-                meta = {{
-                    "title": "Loras_Manga_Coloring_Anima",
-                    "id": lora_slug,
-                    "licenses": [{{"name": "CC0-1.0"}}]
-                }}
-                with open(lora_staging / 'dataset-metadata.json', 'w', encoding='utf-8') as f:
-                    json.dump(meta, f, indent=2)
-
-                api.dataset_create_new(
-                    str(lora_staging),
-                    dir_mode="zip",
-                    public=False,
-                    quiet=False
-                )
-                shutil.rmtree(lora_staging, ignore_errors=True)
-                mark('[Cloud-Cache] Successfully created %s on Kaggle! Future runs will mount LoRAs in 0 seconds.' % lora_slug)
-
-        # 2. Cache Anima Base model (5.6GB)
-        model_slug = f"{{u}}/models-manga-coloring"
-        if not any("models-manga-coloring" in d.lower() for d in user_datasets):
-            snaps = REPO_CACHE / 'snapshots'
-            if snaps.is_dir():
-                latest_snap = next(iter(snaps.iterdir()), None)
-                if latest_snap and latest_snap.is_dir():
-                    mark('[Cloud-Cache] Packaging Anima Base model into private Kaggle dataset (%s)...' % model_slug)
-                    model_staging = Path('/kaggle/working/model_staging')
-                    if model_staging.exists():
-                        shutil.rmtree(model_staging, ignore_errors=True)
-                    shutil.copytree(latest_snap, model_staging, symlinks=False)
-
-                    meta = {{
-                        "title": "Models_Manga_Coloring",
-                        "id": model_slug,
-                        "licenses": [{{"name": "CC0-1.0"}}]
-                    }}
-                    with open(model_staging / 'dataset-metadata.json', 'w', encoding='utf-8') as f:
-                        json.dump(meta, f, indent=2)
-
-                    api.dataset_create_new(
-                        str(model_staging),
-                        dir_mode="zip",
-                        public=False,
-                        quiet=False
-                    )
-                    shutil.rmtree(model_staging, ignore_errors=True)
-                    mark('[Cloud-Cache] Successfully created %s on Kaggle! Future runs will boot in 0 seconds.' % model_slug)
-    except Exception as cache_err:
-        mark('[Cloud-Cache Note] %s' % cache_err)
-
-
 def warm_cache():
-    global CACHE_THREAD
     if LOCAL_MODEL:
         mark('Zero-wait boot: Model detected locally at %s! Skipping 5.6GB HF download.' % LOCAL_MODEL)
     else:
@@ -499,24 +363,7 @@ def warm_cache():
             if not _cached(f):
                 download_file_safe(f, files[f])
 
-    mark('pre-caching LoRAs if needed...')
-    # Check if LoRAs are in any mounted dataset
-    ds_has_loras = False
-    if os.path.exists('/kaggle/input'):
-        for root, dirs, files in os.walk('/kaggle/input'):
-            if MANGA_LORA_FILE in files:
-                ds_has_loras = True
-                break
-    if ds_has_loras:
-        mark('Zero-wait boot: LoRAs mounted in dataset! Skipping LoRA download.')
-    else:
-        download_file_safe(MANGA_LORA_FILE, 100 * 1024 * 1024, repo=MANGA_LORA_REPO)
-        download_file_safe(TURBO_LORA_FILE, 100 * 1024 * 1024, repo=TURBO_LORA_REPO)
-    mark('Model & LoRA environment ready!')
-
-    if not LOCAL_MODEL or not ds_has_loras:
-        CACHE_THREAD = threading.Thread(target=auto_cache_to_kaggle_datasets, daemon=False)
-        CACHE_THREAD.start()
+    mark('Model environment ready!')
 
 
 warm_cache()
@@ -550,19 +397,22 @@ from diffusers import ModularPipeline
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
+MODEL_REPO = {repr(model_repo)}
+MODEL_REVISION = {repr(model_revision)}
+
+
 def find_local_model():
+    """The model folder prepared by the setup cell (see prepare_local_model), if any."""
+    if os.path.isfile('/tmp/mcs_model/modular_model_index.json'):
+        return '/tmp/mcs_model'
     if os.path.exists('/kaggle/input'):
         for root, dirs, files in os.walk('/kaggle/input'):
             if 'model_index.json' in files:
                 return root
     return None
 
+
 LOCAL_MODEL = find_local_model()
-MODEL_ID = LOCAL_MODEL if LOCAL_MODEL else 'circlestone-labs/Anima-Base-v1.0-Diffusers'
-MANGA_LORA_REPO = 'Kutches/Anim4'
-MANGA_LORA_FILE = 'colorMangaAnima.safetensors'
-TURBO_LORA_REPO = 'circlestone-labs/Anima-Official-LoRAs'
-TURBO_LORA_FILE = 'anima-turbo-lora-v0.2.safetensors'
 
 MAX_DIM = {max_dim}
 NUM_STEPS = {num_steps}
@@ -707,7 +557,7 @@ def resolve_lora_path(lora_path_str):
             mark('Downloading LoRA from URL: %s' % lora_path_str)
             import urllib.request, shutil
             headers = {{'User-Agent': 'Mozilla/5.0'}}
-            if os.getenv('HF_TOKEN'):
+            if os.getenv('HF_TOKEN') and 'huggingface.co' in lora_path_str.split('/')[2]:
                 headers['Authorization'] = 'Bearer ' + os.getenv('HF_TOKEN')
             req = urllib.request.Request(lora_path_str, headers=headers)
             with urllib.request.urlopen(req, timeout=300) as resp, open(dest, 'wb') as out_f:
@@ -715,18 +565,11 @@ def resolve_lora_path(lora_path_str):
         return dest
 
     # 3. Check if Hugging Face repo path
-    if '/' in lora_path_str:
+    if lora_path_str.count('/') >= 2:
         parts = lora_path_str.split('/')
-        if len(parts) == 3:
-            repo_id = parts[0] + '/' + parts[1]
-            fname = parts[2]
-            return hf_hub_download(repo_id=repo_id, filename=fname)
-        elif len(parts) == 2 and parts[1].endswith('.safetensors'):
-            repo_id = parts[0]
-            fname = parts[1]
-            return hf_hub_download(repo_id=repo_id, filename=fname)
+        return hf_hub_download(repo_id='/'.join(parts[:2]), filename='/'.join(parts[2:]))
 
-    return lora_path_str
+    raise FileNotFoundError('LoRA %r is not in any mounted dataset and has no download source.' % lora_path_str)
 
 
 def add_lora(lora_path, scale=1.0, transformer=None):
@@ -810,6 +653,21 @@ def load_with_retry(pipe, components, max_attempts=3):
     raise RuntimeError('Failed to load components %r' % components)
 
 
+def load_pipeline(rank):
+    components = ['text_encoder', 'tokenizer', 't5_tokenizer', 'text_conditioner', 'transformer', 'vae']
+    if LOCAL_MODEL:
+        try:
+            pipe = ModularPipeline.from_pretrained(LOCAL_MODEL)
+            load_with_retry(pipe, components)
+            mark('[Core %d] Loaded model from mounted dataset %s' % (rank, LOCAL_MODEL))
+            return pipe
+        except Exception as e:
+            mark('[Core %d] Mounted model failed to load (%r); falling back to %s' % (rank, e, MODEL_REPO))
+    pipe = ModularPipeline.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
+    load_with_retry(pipe, components)
+    return pipe
+
+
 def mp_worker(index, image_paths):
     device = xm.xla_device()
     rank = index
@@ -817,8 +675,7 @@ def mp_worker(index, image_paths):
 
     mark('[Core %d/%d] Initializing pipeline on %s...' % (rank, world_size, device))
 
-    pipe = ModularPipeline.from_pretrained(MODEL_ID)
-    load_with_retry(pipe, ['text_encoder', 'tokenizer', 't5_tokenizer', 'text_conditioner', 'transformer', 'vae'])
+    pipe = load_pipeline(rank)
     pipe = pipe.to(device)
     torch_xla.sync(wait=True)
 
@@ -1051,6 +908,12 @@ for p in IMAGE_PATHS:
 
 print('Prepared work queue: %d total portrait pages (including %d split double-spreads).' % (len(WORK_QUEUE), len(SPREAD_MAP)), flush=True)
 
+# Resolve every LoRA once here, so the 8 TPU processes find them locally instead of
+# all downloading the same file at the same time.
+from tpu_worker import resolve_lora_path
+for _lora in __LORA_PATHS__:
+    print('[LoRA] %s -> %s' % (_lora, resolve_lora_path(_lora)), flush=True)
+
 print('Launching 8-Core Data-Parallel Colorization via PJRT...', flush=True)
 _t_start = time.time()
 try:
@@ -1136,19 +999,10 @@ for temp_path in ['/kaggle/working/split_pages', '/kaggle/working/input_pages', 
             pass
 
 print("All outputs packaged into /kaggle/working/generated.zip! Ready for fast single-archive download.", flush=True)
-
-# ----------------------------------------------------
-# Finalize cloud dataset auto-caching if upload is still in progress
-# ----------------------------------------------------
-try:
-    if 'CACHE_THREAD' in globals() and CACHE_THREAD is not None and CACHE_THREAD.is_alive():
-        print("[Cloud-Cache] Waiting for background dataset caching to finalize upload...", flush=True)
-        CACHE_THREAD.join(timeout=600)
-        print("[Cloud-Cache] Background dataset caching completed or finalized.", flush=True)
-except Exception as _cache_e:
-    print("[Cloud-Cache Note] %s" % _cache_e, flush=True)
 """
-    cell4_lines = cell4_template.replace("__WORKER_CODE_INJECT__", repr(worker_code_str))
+    cell4_lines = (cell4_template
+                   .replace("__WORKER_CODE_INJECT__", repr(worker_code_str))
+                   .replace("__LORA_PATHS__", repr(lora_paths)))
 
     cells.append({
         "cell_type": "code",
@@ -1197,7 +1051,7 @@ except Exception as _cache_e:
     out_file.write_text(json.dumps(nb, indent=1, ensure_ascii=False), encoding="utf-8")
 
     kernel_meta = {
-        "id": f"{kuser}/tpu-image-generation-anima-base-1-0-2b",
+        "id": f"{kuser}/{KERNEL_SLUG}",
         "title": "TPU Image Generation Anima Base 1.0 2B",
         "code_file": "tpu_image_gen_anima.ipynb",
         "language": "python",

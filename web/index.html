@@ -111,7 +111,7 @@
           <div class="card-header">
             <div class="card-title">
               <span class="step-number">2</span>
-              <h3>LoRA & Style Controls</h3>
+              <h3>Model, LoRAs &amp; Style</h3>
             </div>
             <button type="button" class="btn btn-sm btn-outline-accent" id="toggleAddLoraBtn">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -119,28 +119,33 @@
             </button>
           </div>
 
-          <!-- Zero-Wait Cloud Dataset Caching Banner -->
-          <div class="dataset-cache-bar" id="datasetCacheBar">
-            <div class="dataset-cache-info">
-              <div class="dataset-cache-title">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
-                <span>Zero-Wait TPU Datasets</span>
-              </div>
-              <div class="dataset-pills">
-                <span class="pill pill-success" id="lorasDatasetPill" title="Loras_Manga_Coloring_Anima status">LoRAs: Synced</span>
-                <span class="pill pill-muted" id="modelsDatasetPill" title="Models_Manga_Coloring status">Model: Checking...</span>
-              </div>
+          <!-- Model & Kaggle library -->
+          <div class="library-panel" id="libraryPanel">
+            <div class="model-row">
+              <label for="modelSelect" class="model-label">Model</label>
+              <select id="modelSelect" class="form-select model-select"></select>
+              <span class="pill pill-muted" id="modelStatusPill">Loading...</span>
             </div>
-            <div class="dataset-cache-actions">
-              <button type="button" class="btn-icon-link" id="syncLorasBtn" title="Sync local LoRAs to Kaggle dataset">
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
-                <span>Sync LoRAs</span>
-              </button>
-              <button type="button" class="btn-icon-link" id="syncModelsBtn" title="Upload Anima Base model to Kaggle dataset">
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                <span>Upload Model</span>
-              </button>
+            <div class="model-actions">
+              <button type="button" class="btn-icon-link" id="addModelToggleBtn">+ Add model</button>
+              <button type="button" class="btn-icon-link" id="cacheModelBtn" hidden>Cache on Kaggle</button>
+              <button type="button" class="btn-icon-link btn-icon-danger" id="deleteModelBtn">Delete model</button>
+              <button type="button" class="btn-icon-link" id="refreshLibraryBtn" title="Re-check what is cached in your Kaggle datasets">Refresh</button>
             </div>
+            <div class="add-model-form" id="addModelForm" hidden>
+              <input type="text" id="newModelUrl" class="library-input" placeholder="Hugging Face repo, e.g. circlestone-labs/Anima-Base-v1.0-Diffusers">
+              <input type="text" id="newModelName" class="library-input" placeholder="Display name (optional)">
+              <div class="add-model-footer">
+                <span class="library-hint">Anima models in Diffusers format. A CPU notebook downloads and caches it, so no TPU time is used.</span>
+                <button type="button" class="btn btn-primary btn-sm" id="submitAddModelBtn">Add &amp; cache</button>
+              </div>
+              <div class="library-error" id="addModelError" hidden></div>
+            </div>
+            <div class="library-activity" id="libraryActivity" hidden></div>
+            <details class="legacy-datasets" id="legacyDatasets" hidden>
+              <summary>Older app datasets on Kaggle</summary>
+              <div id="legacyList"></div>
+            </details>
           </div>
 
           <!-- Add New LoRA Form Modal / Accordion -->
@@ -164,7 +169,7 @@
               </div>
 
               <div class="form-group">
-                <label for="newLoraCivitaiToken">Civitai API Key <span style="font-size:0.72rem; color:var(--text-dim);">(Only if downloading mature models)</span></label>
+                <label for="newLoraCivitaiToken">Civitai API Key <span style="font-size:0.72rem; color:var(--text-dim);">(only for mature models: the download then runs on this PC, so the key stays here)</span></label>
                 <input type="password" id="newLoraCivitaiToken" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.8rem;" placeholder="Optional Civitai API Key">
               </div>
 
@@ -188,7 +193,7 @@
 
                 <div class="form-actions" style="display: flex; gap: 8px;">
                   <button type="button" class="btn btn-secondary btn-sm" id="cancelAddLoraBtn">Cancel</button>
-                  <button type="button" class="btn btn-primary btn-sm" id="submitAddLoraBtn">Download & Add</button>
+                  <button type="button" class="btn btn-primary btn-sm" id="submitAddLoraBtn">Add &amp; cache</button>
                 </div>
               </div>
             </div>
@@ -224,7 +229,7 @@
 
                 <div class="form-actions" style="display: flex; gap: 8px;">
                   <button type="button" class="btn btn-secondary btn-sm" id="cancelUploadLoraBtn">Cancel</button>
-                  <button type="button" class="btn btn-primary btn-sm" id="submitUploadLoraBtn">Upload & Add</button>
+                  <button type="button" class="btn btn-primary btn-sm" id="submitUploadLoraBtn">Upload &amp; cache</button>
                 </div>
               </div>
             </div>
@@ -337,6 +342,25 @@
               <button class="tab-btn" id="tabSideBySide">Side-by-Side</button>
               <button class="tab-btn" id="tabGridView">Grid View</button>
             </div>
+          </div>
+
+          <!-- Post-processing & re-run tools -->
+          <div class="studio-tools" id="studioTools">
+            <div class="tool-group">
+              <label class="tool-label" for="lineartSlider" title="Multiplies the original scan's lines over the color so they stay crisp">
+                Lineart <span id="lineartVal">0.50</span>
+              </label>
+              <input type="range" id="lineartSlider" min="0" max="1" step="0.05" value="0.5">
+              <label class="tool-check" title="Pastes detected speech bubbles back from the original scan so text is never garbled">
+                <input type="checkbox" id="bubblesToggle"> Keep speech bubbles
+              </label>
+              <button class="btn btn-secondary btn-sm" id="applyPostBtn" disabled>Apply to chapter</button>
+            </div>
+            <div class="tool-group">
+              <button class="btn btn-secondary btn-sm" id="rerunPageBtn" title="Colorize this page again with the current prompt and LoRAs">Re-run this page</button>
+              <button class="btn btn-secondary btn-sm" id="rerunSelectedBtn" disabled title="Tick pages in Grid View to select them">Re-run selected (0)</button>
+            </div>
+            <div class="tool-hint" id="studioHint"></div>
           </div>
 
           <!-- 1. Split Comparison Slider View -->
@@ -510,7 +534,7 @@
         <div id="paneSettingsManual" style="display: none;">
           <div class="form-group" style="margin-bottom: 10px;">
             <label for="inputKaggleUsername" style="font-size: 0.78rem; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; display: block;">Kaggle Username</label>
-            <input type="text" id="inputKaggleUsername" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.84rem;" placeholder="e.g. mobasharulislam">
+            <input type="text" id="inputKaggleUsername" class="form-input" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 0.84rem;" placeholder="your Kaggle username">
           </div>
           <div class="form-group" style="margin-bottom: 14px;">
             <label for="inputKaggleKey" style="font-size: 0.78rem; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; display: block;">Kaggle API Key</label>

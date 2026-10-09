@@ -1,8 +1,17 @@
 import builtins
 import os
 import sys
+import zipfile
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from scripts.common import KERNEL_SLUG, resolve_kaggle_username
 
 # Monkey-patch builtins.open to default to utf-8 when encoding is not specified
+# (the Kaggle client writes kernel logs with the platform encoding on Windows).
 orig_open = builtins.open
 
 def utf8_open(*args, **kwargs):
@@ -15,37 +24,13 @@ def utf8_open(*args, **kwargs):
 
 builtins.open = utf8_open
 
+from kaggle.api.kaggle_api_extended import KaggleApi
+
 api = KaggleApi()
 api.authenticate()
 
-def resolve_kaggle_user():
-    if len(sys.argv) > 2 and sys.argv[2]:
-        return sys.argv[2]
-    if hasattr(api, "config_values") and api.config_values.get("username"):
-        return api.config_values["username"]
-    try:
-        val = api.get_config_value("username")
-        if val:
-            return val
-    except Exception:
-        pass
-    u = os.getenv("KAGGLE_USERNAME")
-    if u and u != "your_kaggle_username":
-        return u
-    try:
-        import json
-        from pathlib import Path
-        kjson = Path.home() / ".kaggle" / "kaggle.json"
-        if kjson.exists():
-            data = json.loads(kjson.read_text(encoding="utf-8"))
-            if data.get("username"):
-                return data["username"]
-    except Exception:
-        pass
-    return "mobasharulislam"
-
-kaggle_user = resolve_kaggle_user()
-kernel = f"{kaggle_user}/tpu-image-generation-anima-base-1-0-2b"
+kaggle_user = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else resolve_kaggle_username(api)
+kernel = f"{kaggle_user}/{sys.argv[3] if len(sys.argv) > 3 else KERNEL_SLUG}"
 dest = sys.argv[1] if len(sys.argv) > 1 else "output_anima/out_v21"
 os.makedirs(dest, exist_ok=True)
 
@@ -54,17 +39,13 @@ api.kernels_output(kernel, path=dest, force=True)
 print("Downloaded files:", os.listdir(dest))
 
 # Auto-extract any downloaded zip archives into dest
-import zipfile
 for fname in os.listdir(dest):
     if fname.endswith(".zip"):
         zpath = os.path.join(dest, fname)
         print(f"Extracting {fname} into {dest}...")
-        try:
-            with zipfile.ZipFile(zpath, "r") as zf:
-                zf.extractall(dest)
-            print(f"Extracted {fname} successfully.")
-        except Exception as ze:
-            print(f"Failed to extract {fname}: {ze}")
+        with zipfile.ZipFile(zpath, "r") as zf:
+            zf.extractall(dest)
+        print(f"Extracted {fname} successfully.")
 
 # Also read the log file if present
 log_files = [f for f in os.listdir(dest) if f.endswith('.log')]
@@ -80,4 +61,3 @@ for lf in log_files:
                 print(l)
             except Exception:
                 print(l.encode('ascii', 'replace').decode('ascii'))
-
