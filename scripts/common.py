@@ -10,6 +10,23 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 SCANS_DATASET_SLUG = "manga-color-scans"
 KERNEL_SLUG = "tpu-image-generation-anima-base-1-0-2b"
 
+# Hardware a colorization run can use. Each gets its own Kaggle notebook, so a run queued on
+# one never blocks another (Kaggle's API can't cancel runs). Titles must slugify to the slug.
+ACCELERATORS = {
+    "tpu": {
+        "label": "TPU v5e-8", "quota": "TPU", "backend": "tpu", "slug": KERNEL_SLUG,
+        "title": "TPU Image Generation Anima Base 1.0 2B", "dir": "kernel_anima", "machine_shape": None,
+    },
+    "gpu_t4": {
+        "label": "GPU T4 x2", "quota": "GPU", "backend": "gpu", "slug": "manga-color-gpu-t4",
+        "title": "Manga Color GPU T4", "dir": "kernel_gpu_t4", "machine_shape": "NvidiaTeslaT4",
+    },
+    "gpu_p100": {
+        "label": "GPU P100", "quota": "GPU", "backend": "gpu", "slug": "manga-color-gpu-p100",
+        "title": "Manga Color GPU P100", "dir": "kernel_gpu_p100", "machine_shape": "NvidiaTeslaP100",
+    },
+}
+
 
 def natural_key(name: str):
     """Sort key that orders 'page_2' before 'page_10'."""

@@ -16,12 +16,20 @@
       "port": 7860
     },
     {
-      "name": "library-test",
+      "name": "lineart-studio",
       "runtimeExecutable": "python",
       "runtimeArgs": [
-        "C:\\Users\\mobas\\AppData\\Local\\Temp\\claude\\C--Users-mobas-Desktop-Games-Manga-Color-kaggle-tpu-image-gen\\f47d033b-113b-4b0d-936e-58849cb51072\\scratchpad\\launch_test.py"
+        "-m",
+        "uvicorn",
+        "app.server:app",
+        "--app-dir",
+        "C:\\Users\\mobas\\Desktop\\Games\\Manga-Color\\lineart_studio",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "7880"
       ],
-      "port": 7872
+      "port": 7880
     }
   ]
 }

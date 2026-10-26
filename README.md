@@ -1,4 +1,4 @@
-# Manga Color Studio 🎨 (Distributed 8-Core TPU v5-8 Pipeline)
+# Manga Color Studio 🎨 (Kaggle TPU & GPU Pipeline)
 
 High-performance manga chapter colorization powered by **Anima Base 1.0 (2B)** running across **8 TPU Cores (TPU v5-8)** in parallel via PyTorch XLA (PJRT).
 
@@ -6,7 +6,7 @@ High-performance manga chapter colorization powered by **Anima Base 1.0 (2B)** r
 
 ## ✨ Key Features
 
-- **🚀 Distributed 8-Core Parallelism**: Shards full manga chapters evenly across 8 hardware TPU cores, delivering complete 50+ page chapter colorization in minutes.
+- **🚀 TPU or GPU**: Run on Kaggle's 8-core TPU v5e-8 (fastest for long chapters) or on GPU T4 x2 / P100 (usually starts within minutes when the TPU queue is long). The app shows your remaining weekly hours for each.
 - **⚡ 1-Click Launch**: Double-click `run.bat` — all dependencies and local web servers are configured automatically.
 - **🔑 In-UI API Token Setup**: Drag & drop your `kaggle.json` or paste your Kaggle & Hugging Face tokens directly into the browser without editing config files.
 - **📦 Instant Chapter Ingestion**: Drag & drop folder directories or `.zip` / `.cbz` archives with in-memory single-stream packaging.
@@ -53,10 +53,19 @@ The **Model, LoRAs & Style** card lists every model and LoRA, whether it is cach
 | `HF_TOKEN` | Library Worker, TPU notebook | Optional: gated repos / faster Hugging Face downloads |
 | `CIVITAI_TOKEN` | Library Worker | Optional: mature Civitai LoRAs (or enter your Civitai key in the app, which then downloads on your PC) |
 
-### 5. Colorize a Chapter
+### 5. Choose Hardware
+| Option | Starts | Notes |
+|---|---|---|
+| **TPU v5e-8** | The TPU queue can take hours on busy days | 8 cores in parallel; fastest on long chapters. ~4 min one-time compile per run. Double-page spreads are colorized as two halves. |
+| **GPU T4 x2** | Usually within minutes | 2 GPUs in parallel. Double-page spreads are colorized whole. Runs in float16, switching to float32 automatically if a page comes out blank. |
+| **GPU P100** | Usually within minutes | 1 GPU, roughly half the speed of T4 x2. |
+
+TPU and GPU hours are separate weekly Kaggle quotas. Each option uses its own Kaggle notebook, so a run waiting in one queue never blocks another.
+
+### 6. Colorize a Chapter
 1. Click **Select Folder** (or drop a `.zip`/`.cbz` file).
 2. Adjust positive prompts or select a style preset.
-3. Click **Colorize Chapter on 8-Core TPU**.
+3. Pick the **Hardware** and click **Colorize Chapter**.
 4. Monitor real-time logs and compare before/after results in the comparison studio!
 5. Adjust **Lineart** / **Keep speech bubbles** and click **Apply to chapter**; re-run any page that came out wrong.
 

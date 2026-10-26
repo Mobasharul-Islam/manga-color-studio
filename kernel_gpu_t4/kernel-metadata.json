@@ -1,0 +1,18 @@
+{
+ "id": "rabiulislam5788/manga-color-gpu-t4",
+ "title": "Manga Color GPU T4",
+ "code_file": "colorize.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": "true",
+ "enable_gpu": "true",
+ "enable_tpu": "false",
+ "enable_internet": "true",
+ "dataset_sources": [
+  "rabiulislam5788/manga-color-scans",
+  "rabiulislam5788/models-manga-coloring",
+  "rabiulislam5788/loras-manga-coloring-anima"
+ ],
+ "kernel_sources": [],
+ "machine_shape": "NvidiaTeslaT4"
+}

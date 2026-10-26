@@ -10,7 +10,7 @@ import asyncio
 import threading
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from PIL import Image
 
 from scripts.common import (
-    IMAGE_EXTS, KERNEL_SLUG, SCANS_DATASET_SLUG, natural_key, safe_name, resolve_kaggle_username,
+    ACCELERATORS, IMAGE_EXTS, SCANS_DATASET_SLUG, natural_key, safe_name, resolve_kaggle_username,
 )
 from app import library, postprocess
 
@@ -35,7 +35,6 @@ WEB_DIR = BASE_DIR / "web"
 INPUT_DIR = BASE_DIR / "input_pages"
 OUTPUT_DIR = BASE_DIR / "output_app"
 SCRIPTS_DIR = BASE_DIR / "scripts"
-KERNEL_DIR = BASE_DIR / "kernel_anima"
 
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -45,6 +44,8 @@ app = FastAPI(title="Manga Colorization TPU Studio")
 class NoCacheMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
+        if request.url.path.startswith("/api/image/thumb/"):
+            return response  # versioned URLs (?v=mtime): safe to cache
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -106,6 +107,8 @@ class JobStartRequest(BaseModel):
     loras: List[LoraConfig] = []  # ignored: LoRAs and model come from the library
     # Original scan file names to re-run within an existing chapter; empty = whole chapter.
     pages: List[str] = []
+    # Key of scripts.common.ACCELERATORS: "tpu", "gpu_t4" or "gpu_p100".
+    accelerator: str = "tpu"
 
 
 def _image_item(path: Path) -> Dict[str, Any]:
@@ -114,6 +117,7 @@ def _image_item(path: Path) -> Dict[str, Any]:
         "path": str(path),
         "size": path.stat().st_size,
         "url": f"/api/image/input/{path.name}",
+        "thumb_url": f"/api/image/thumb/loaded/input/{path.name}?v={int(path.stat().st_mtime)}",
     }
 
 
@@ -174,12 +178,7 @@ async def select_folder():
     for src in found_files:
         dst = INPUT_DIR / Path(src).name
         shutil.copy2(src, dst)
-        copied_images.append({
-            "name": Path(src).name,
-            "path": str(dst),
-            "size": dst.stat().st_size,
-            "url": f"/api/image/input/{Path(src).name}"
-        })
+        copied_images.append(_image_item(dst))
 
     with state_lock:
         job_state["chapter_name"] = Path(folder).name or "chapter_01"
@@ -306,15 +305,8 @@ async def upload_images(files: List[UploadFile] = File(...)):
 @app.get("/api/files")
 def get_current_files():
     images = []
-    for f in sorted(glob.glob(str(INPUT_DIR / "*"))):
-        ext = Path(f).suffix.lower()
-        if ext in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
-            images.append({
-                "name": Path(f).name,
-                "path": f,
-                "size": os.path.getsize(f),
-                "url": f"/api/image/input/{Path(f).name}"
-            })
+    for f in _sorted_images(INPUT_DIR):
+        images.append(_image_item(f))
     return {"images": images, "chapter_name": job_state["chapter_name"]}
 
 
@@ -334,8 +326,15 @@ class SaveSettingsRequest(BaseModel):
     hf_token: Optional[str] = None
 
 
+_kaggle_api = None
+
+
 def get_kaggle_api_safe(verify_online: bool = False):
-    """Lazily imports and tests KaggleApi without raising unhandled errors."""
+    """Authenticated KaggleApi, or None. The client is cached (authenticating takes ~1.7 s);
+    verify_online=True rebuilds it from the current credentials and checks them online."""
+    global _kaggle_api
+    if _kaggle_api is not None and not verify_online:
+        return _kaggle_api
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
         api = KaggleApi()
@@ -343,8 +342,10 @@ def get_kaggle_api_safe(verify_online: bool = False):
         if verify_online:
             u = getattr(api, "config_values", {}).get("username") or os.getenv("KAGGLE_USERNAME")
             api.dataset_list(user=u)
+        _kaggle_api = api
         return api
     except Exception:
+        _kaggle_api = None
         return None
 
 
@@ -541,15 +542,30 @@ def _sorted_images(folder: Path) -> List[Path]:
     return sorted(files, key=lambda p: natural_key(p.name))
 
 
+def pair_originals(chapter_dir: Path) -> Dict[str, Tuple[Path, bool]]:
+    """{generated file name: (original scan, matched_by_name)} from the chapter's input snapshot.
+
+    Pages the app colorizes are named edit_<scan stem>.png and match by name. Chapters put
+    together outside the app (e.g. ComfyUI's 0_00001_.png) can't match by name; when no page
+    does and both folders hold the same number of images, they are paired in sorted order.
+    """
+    inputs = _sorted_images(chapter_dir / "input")
+    colors = sorted((chapter_dir / "generated").glob("*.png"), key=lambda f: natural_key(f.name))
+    by_stem = {f.stem: f for f in inputs}
+    pairs = {}
+    for c in colors:
+        stem = c.stem[len("edit_"):] if c.stem.startswith("edit_") else c.stem
+        if stem in by_stem:
+            pairs[c.name] = (by_stem[stem], True)
+    if not pairs and inputs and len(inputs) == len(colors):
+        pairs = {c.name: (i, False) for c, i in zip(colors, inputs)}
+    return pairs
+
+
 def find_original(chapter_dir: Path, color_name: str) -> Optional[Path]:
-    """Original scan for a generated page, from the chapter's input snapshot."""
-    stem = Path(color_name).stem
-    if stem.startswith("edit_"):
-        stem = stem[len("edit_"):]
-    for f in _sorted_images(chapter_dir / "input"):
-        if f.stem == stem:
-            return f
-    return None
+    """Original scan for one generated page, or None."""
+    match = pair_originals(chapter_dir).get(Path(color_name).name)
+    return match[0] if match else None
 
 
 def load_post_settings(chapter_dir: Path) -> postprocess.PostSettings:
@@ -568,11 +584,12 @@ def postprocess_chapter(chapter_dir: Path, settings: postprocess.PostSettings, o
     final_dir = chapter_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     count = 0
+    pairs = pair_originals(chapter_dir)
     for color_file in sorted((chapter_dir / "generated").glob("*.png")):
         if only is not None and color_file.name not in only:
             continue
         dst = final_dir / color_file.name
-        original = find_original(chapter_dir, color_file.name)
+        original = pairs.get(color_file.name, (None, False))[0]
         if settings.is_noop or original is None:
             dst.unlink(missing_ok=True)
             continue
@@ -666,7 +683,7 @@ def upload_scans_dataset(api, kaggle_user: str, scans: List[Path], chapter_name:
     )
 
 
-def monitor_kernel(sys_py: str, kernel_name: str):
+def monitor_kernel(sys_py: str, kernel_name: str, label: str):
     deadline = time.time() + KERNEL_TIMEOUT_S
     is_running = False
     failures = 0
@@ -692,15 +709,15 @@ def monitor_kernel(sys_py: str, kernel_name: str):
         if "QUEUED" in status_text:
             with state_lock:
                 job_state["status"] = "queued"
-                job_state["phase_message"] = "Queued on Kaggle TPU allocator..."
+                job_state["phase_message"] = f"Queued for a Kaggle {label}..."
             log_message(f"Status: QUEUED ({job_state['elapsed_seconds']}s elapsed)")
         elif "RUNNING" in status_text:
             if not is_running:
                 is_running = True
-                log_message("TPU VM Allocated! 8 Cores are initializing & colorizing...")
+                log_message(f"{label} allocated! Loading the model & colorizing...")
             with state_lock:
                 job_state["status"] = "running"
-                job_state["phase_message"] = "8 TPU Cores Generating in Parallel..."
+                job_state["phase_message"] = f"Colorizing on {label}..."
             log_message(f"Status: RUNNING ({job_state['elapsed_seconds']}s elapsed)")
         elif "COMPLETE" in status_text:
             log_message("Kaggle Kernel Completed Successfully!")
@@ -714,10 +731,11 @@ def background_tpu_runner(req: JobStartRequest):
     sys_py = sys.executable
     safe_chapter = safe_name(req.chapter_name)
     chapter_dir = OUTPUT_DIR / safe_chapter
+    acc = ACCELERATORS[req.accelerator]
     try:
         with state_lock:
             job_state["status"] = "preparing"
-            job_state["phase_message"] = "Generating TPU multi-core notebook..."
+            job_state["phase_message"] = "Preparing the notebook..."
             job_state["chapter_name"] = safe_chapter
             job_state["start_time"] = time.time()
             job_state["error"] = None
@@ -730,7 +748,7 @@ def background_tpu_runner(req: JobStartRequest):
             raise RuntimeError("Kaggle API is not authenticated. Please check your Kaggle API key in Settings.")
 
         log_message("=== Starting Manga Colorization Job ===")
-        log_message(f"User: @{kaggle_user} | Chapter: {safe_chapter} | Max Dim: {req.max_dim}px | Steps: {req.num_steps}")
+        log_message(f"User: @{kaggle_user} | Chapter: {safe_chapter} | Hardware: {acc['label']} | Max Dim: {req.max_dim}px | Steps: {req.num_steps}")
 
         # 1. Pick the scans: selected pages of an existing chapter, or the whole loaded chapter
         if req.pages:
@@ -771,23 +789,24 @@ def background_tpu_runner(req: JobStartRequest):
             guidance_scale=req.guidance_scale,
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
-            out_notebook_path="kernel_anima/tpu_image_gen_anima.ipynb"
+            accelerator=req.accelerator,
         )
         log_message("Notebook successfully compiled.")
 
         # 3. Push to Kaggle
         with state_lock:
             job_state["status"] = "pushing"
-            job_state["phase_message"] = "Pushing kernel to Kaggle TPU Cluster..."
-        log_message("Pushing kernel to Kaggle...")
+            job_state["phase_message"] = f"Pushing the notebook to Kaggle ({acc['label']})..."
+        log_message(f"Pushing notebook {kaggle_user}/{acc['slug']} ({acc['label']})...")
 
-        push_res = subprocess.run([sys_py, "-m", "kaggle", "kernels", "push", "-p", "kernel_anima"], capture_output=True, text=True, cwd=BASE_DIR)
+        push_res = subprocess.run([sys_py, "-m", "kaggle", "kernels", "push", "-p", acc["dir"]], capture_output=True, text=True, cwd=BASE_DIR)
         log_message(push_res.stdout.strip())
-        if push_res.returncode != 0:
-            raise RuntimeError(f"Kaggle push failed: {push_res.stderr}")
+        # The CLI can exit 0 while printing "Kernel push error: ..."
+        if push_res.returncode != 0 or "error" in (push_res.stdout or "").lower():
+            raise RuntimeError(f"Kaggle push failed: {(push_res.stderr or push_res.stdout).strip()}")
 
         # 4. Monitor Kaggle Kernel execution
-        monitor_kernel(sys_py, f"{kaggle_user}/{KERNEL_SLUG}")
+        monitor_kernel(sys_py, f"{kaggle_user}/{acc['slug']}", acc["label"])
 
         # 5. Download results into a scratch folder, then merge into the chapter
         with state_lock:
@@ -797,7 +816,7 @@ def background_tpu_runner(req: JobStartRequest):
         shutil.rmtree(download_dir, ignore_errors=True)
         log_message(f"Downloading outputs to {chapter_dir}...")
 
-        dl_res = subprocess.run([sys_py, str(SCRIPTS_DIR / "download_fixed.py"), str(download_dir), kaggle_user], capture_output=True, text=True, cwd=BASE_DIR)
+        dl_res = subprocess.run([sys_py, str(SCRIPTS_DIR / "download_fixed.py"), str(download_dir), kaggle_user, acc["slug"]], capture_output=True, text=True, cwd=BASE_DIR)
         if dl_res.stdout:
             log_message(dl_res.stdout[-300:])
         if dl_res.returncode != 0:
@@ -840,6 +859,8 @@ def background_tpu_runner(req: JobStartRequest):
 
 @app.post("/api/start")
 def start_colorization_job(req: JobStartRequest, background_tasks: BackgroundTasks):
+    if req.accelerator not in ACCELERATORS:
+        raise HTTPException(status_code=400, detail=f"Unknown hardware '{req.accelerator}'.")
     try:
         library.run_spec()
     except ValueError as e:
@@ -853,6 +874,31 @@ def start_colorization_job(req: JobStartRequest, background_tasks: BackgroundTas
 
     background_tasks.add_task(background_tpu_runner, req)
     return {"status": "started", "chapter": req.chapter_name}
+
+
+@app.get("/api/accelerators")
+def get_accelerators():
+    """Hardware options with the account's remaining weekly Kaggle quota."""
+    quota = {}
+    api = get_kaggle_api_safe()
+    if api is not None:
+        try:
+            res = api.quota_view()
+            refresh = res.quota_refresh_time.isoformat() if res.quota_refresh_time else ""
+            for name, q in (("GPU", res.gpu_quota), ("TPU", res.tpu_quota)):
+                if q is None:
+                    continue
+                # timedeltas: use total_seconds() (the SDK's JSON dump drops the days part)
+                used = q.time_used.total_seconds() / 3600
+                total = q.total_time_allowed.total_seconds() / 3600
+                quota[name] = {"used_hours": round(used, 2), "remaining_hours": round(max(0.0, total - used), 2),
+                               "total_hours": round(total, 2), "refresh_at": refresh}
+        except Exception as e:
+            log_message(f"Could not read Kaggle quota: {e}")
+    return {"accelerators": [
+        {"id": key, "label": a["label"], "quota_type": a["quota"], "quota": quota.get(a["quota"])}
+        for key, a in ACCELERATORS.items()
+    ]}
 
 
 @app.get("/api/status")
@@ -908,7 +954,8 @@ def get_results(chapter: Optional[str] = None):
         if curr_job_ch and curr_job_ch in available_chapters:
             selected_chapter = curr_job_ch
         elif available_chapters:
-            selected_chapter = available_chapters[0]
+            # most recently colorized chapter
+            selected_chapter = max(available_chapters, key=lambda c: (OUTPUT_DIR / c / "generated").stat().st_mtime)
         else:
             selected_chapter = "Chapter_1"
 
@@ -916,6 +963,7 @@ def get_results(chapter: Optional[str] = None):
     chapter_dir = OUTPUT_DIR / safe_chapter
     generated_dir = chapter_dir / "generated"
     has_snapshot = (chapter_dir / "input").is_dir()
+    originals = pair_originals(chapter_dir) if has_snapshot else {}
     legacy_inputs = [] if has_snapshot else _sorted_images(INPUT_DIR)
 
     pairs = []
@@ -927,7 +975,7 @@ def get_results(chapter: Optional[str] = None):
         kind = "final" if shown is final_file else "generated"
         version = int(shown.stat().st_mtime)
 
-        original = find_original(chapter_dir, name) if has_snapshot else None
+        original, by_name = originals.get(name, (None, False))
         if original is not None:
             input_url = f"/api/image/chapter/{safe_chapter}/input/{original.name}"
         else:
@@ -938,9 +986,12 @@ def get_results(chapter: Optional[str] = None):
             "color_name": name,
             "color_url": f"/api/image/chapter/{safe_chapter}/{kind}/{name}?v={version}",
             "raw_url": f"/api/image/chapter/{safe_chapter}/generated/{name}?v={int(color_file.stat().st_mtime)}",
+            "thumb_url": f"/api/image/thumb/{safe_chapter}/{kind}/{name}?v={version}",
             "input_url": input_url or f"/api/image/chapter/{safe_chapter}/generated/{name}",
-            # Original scan name, needed to re-run this page; None for legacy chapters.
-            "page": original.name if original is not None else None,
+            # Lineart/bubble restore needs the original scan.
+            "has_original": original is not None,
+            # Re-runs write edit_<scan>.png, so they only replace pages matched by name.
+            "page": original.name if original is not None and by_name else None,
         })
 
     settings = load_post_settings(chapter_dir)
@@ -949,7 +1000,7 @@ def get_results(chapter: Optional[str] = None):
         "available_chapters": available_chapters,
         "count": len(pairs),
         "pairs": pairs,
-        "can_postprocess": has_snapshot,
+        "can_postprocess": bool(originals),
         "postprocess": {"lineart_strength": settings.lineart_strength, "preserve_bubbles": settings.preserve_bubbles},
     }
 
@@ -966,8 +1017,8 @@ async def postprocess_endpoint(req: PostprocessRequest):
     chapter_dir = chapter_dir_for(req.chapter)
     if not (chapter_dir / "generated").is_dir():
         raise HTTPException(status_code=404, detail="Chapter not found")
-    if not (chapter_dir / "input").is_dir():
-        raise HTTPException(status_code=400, detail="This chapter was colorized before original scans were kept, so it cannot be post-processed.")
+    if not pair_originals(chapter_dir):
+        raise HTTPException(status_code=400, detail="No original scans match this chapter's pages, so it cannot be post-processed.")
     settings = postprocess.PostSettings(
         lineart_strength=max(0.0, min(1.0, req.lineart_strength)),
         preserve_bubbles=req.preserve_bubbles,
@@ -996,6 +1047,31 @@ def preview_postprocess(chapter: str, filename: str, lineart: float = 0.5, bubbl
     buf = io.BytesIO()
     out.convert("RGB").save(buf, format="JPEG", quality=92)
     return Response(content=buf.getvalue(), media_type="image/jpeg")
+
+
+THUMB_HEIGHT = 240
+
+
+@app.get("/api/image/thumb/{chapter}/{kind}/{filename}")
+def get_thumbnail(chapter: str, kind: str, filename: str):
+    """Small cached JPEG of a page, for page strips and grids (full pages are 1-2 MB each)."""
+    name = Path(filename).name
+    if chapter == "loaded" and kind == "input":
+        src, cache_dir = INPUT_DIR / name, INPUT_DIR / ".thumbs"
+    elif kind in {"input", "generated", "final"}:
+        src, cache_dir = chapter_dir_for(chapter) / kind / name, chapter_dir_for(chapter) / ".thumbs" / kind
+    else:
+        raise HTTPException(status_code=404, detail="Unknown image kind")
+    if not src.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    thumb = cache_dir / (Path(name).stem + ".jpg")
+    if not thumb.exists() or thumb.stat().st_mtime < src.stat().st_mtime:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with Image.open(src) as im:
+            im = im.convert("RGB")
+            im.thumbnail((THUMB_HEIGHT * 3, THUMB_HEIGHT))
+            im.save(thumb, "JPEG", quality=82)
+    return FileResponse(str(thumb), headers={"Cache-Control": "max-age=86400"})
 
 
 @app.get("/api/image/chapter/{chapter}/{kind}/{filename}")
