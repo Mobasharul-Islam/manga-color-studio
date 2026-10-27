@@ -73,6 +73,22 @@ Each chapter is stored under `output_app/<chapter>/`: `input/` (original scans),
 
 ---
 
+### 7. (Optional) Encrypt scans & results
+Without encryption, your scans sit in a private Kaggle dataset (`manga-color-scans`) and the colorized pages in the notebook's output, both readable by anyone with access to your Kaggle account.
+
+1. Under **Accounts & tokens**, set an **Encryption key** (at least 12 characters). It's saved in your local `.env`. **Keep a copy:** without it, results can't be decrypted.
+2. Turn on **Encrypt scans & results** in the Run panel. Nothing needs setting up on kaggle.com.
+
+What happens:
+- **Upload:** the scans are zipped, then encrypted (AES-256-GCM, key derived with scrypt), and uploaded to a separate dataset, `manga-color-scans-enc`.
+- **The key:** each run sends it to Kaggle as a temporary private dataset (`mcs-key-…`) that only that run's notebook mounts. The app deletes it when the run ends, whether the run succeeds, fails or is cancelled, and again on its next start if it was closed mid-run. The notebook checks the key against the app's key fingerprint before installing anything.
+- **Results:** encrypted before Kaggle saves them; the app decrypts them after download.
+- **Nothing readable is saved on Kaggle:** readable pages exist only in the notebook's temporary `/tmp` while it runs, never in its saved output, even if it crashes.
+
+To open an encrypted file yourself (for example `generated.mcsenc` downloaded from a notebook's output), use the **Decrypter** app in the `decrypter` folder next to this project: drop the file, enter the key, and it extracts the pages.
+
+Older, unencrypted copies remain on Kaggle until you delete them: the `manga-color-scans` dataset's version history, and the outputs of earlier notebook versions.
+
 ## 🛠️ Requirements
 
 - **OS**: Windows 10/11, macOS, or Linux.

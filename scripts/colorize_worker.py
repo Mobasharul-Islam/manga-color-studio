@@ -17,6 +17,12 @@ Backends:
 - "cpu": local testing only.
 
 Nothing secret is embedded: an optional HF_TOKEN is read from Kaggle Secrets.
+
+Encryption (CONFIG["encrypted"]): the scans arrive as an AES-encrypted .mcsenc archive and the
+results leave as one. The key comes from the MCS_ENCRYPTION_KEY Kaggle Secret and is checked
+against the app's key fingerprint. Every readable page lives only in /tmp, never in
+/kaggle/working (which Kaggle saves as the notebook's output), so even a crash mid-run leaves
+nothing readable behind.
 """
 import gc
 import json
@@ -57,6 +63,40 @@ def input_root():
 
 def work_dir():
     return cfg("work_dir", "/kaggle/working")
+
+
+def encrypted():
+    return bool(cfg("encrypted"))
+
+
+def pages_dir():
+    """Where scans and colorized pages live during the run. When encrypting, a folder outside
+    /kaggle/working so nothing readable can end up in the saved notebook output."""
+    return cfg("scratch_dir", "/tmp/mcs_work") if encrypted() else work_dir()
+
+
+_KEY = {"value": None}
+
+
+def load_key():
+    """The passphrase from the app's temporary key dataset, checked against the app's fingerprint."""
+    import mcs_crypto
+    key = ""
+    for root, _dirs, files in os.walk(input_root()):
+        if mcs_crypto.KEY_FILE in files:
+            with open(os.path.join(root, mcs_crypto.KEY_FILE), encoding="utf-8") as f:
+                key = f.read().strip()
+            break
+    if not key:
+        raise RuntimeError(
+            "Encryption is on, but the temporary key dataset is not mounted in this notebook. "
+            "Start the run again from the app.")
+    if mcs_crypto.fingerprint(key) != cfg("key_fingerprint"):
+        raise RuntimeError(
+            "The mounted encryption key is not the key set in the app (fingerprints %s vs %s). "
+            "Start the run again from the app." % (mcs_crypto.fingerprint(key), cfg("key_fingerprint")))
+    _KEY["value"] = key
+    return key
 
 
 def local_model_dir():
@@ -604,7 +644,7 @@ def mp_worker(rank, image_paths, n_workers):
     mark("%s Initializing pipeline on %s..." % (tag, device))
     pipe = build_pipeline(device, plans[plan_idx], tag)
 
-    out_dir = os.path.join(work_dir(), "generated")
+    out_dir = os.path.join(pages_dir(), "generated")
     os.makedirs(out_dir, exist_ok=True)
     my_paths = image_paths[rank::n_workers]
     mark("%s Ready! Assigned %d images | memory: %s" % (tag, len(my_paths), mem_info(device)))
@@ -657,10 +697,22 @@ def mp_worker(rank, image_paths, n_workers):
 # ------------------------------------------------------------------ orchestration
 
 def collect_scans():
-    unzip_dir = os.path.join(work_dir(), "input_pages")
+    unzip_dir = os.path.join(pages_dir(), "input_pages")
     os.makedirs(unzip_dir, exist_ok=True)
     if os.path.exists(input_root()):
         for root, dirs, files in os.walk(input_root()):
+            for name in files:
+                if not name.endswith(".mcsenc"):
+                    continue
+                import mcs_crypto
+                if _KEY["value"] is None:
+                    raise RuntimeError("Found encrypted scans (%s) but encryption is off for this run." % name)
+                plain = os.path.join(pages_dir(), "scans.zip")
+                mcs_crypto.decrypt_file(os.path.join(root, name), plain, _KEY["value"])
+                with zipfile.ZipFile(plain) as z:
+                    z.extractall(unzip_dir)
+                os.remove(plain)
+                print("[Decrypt] Decrypted and extracted '%s'" % name, flush=True)
             for zf in files:
                 if zf.lower().endswith(".zip") and "model" not in zf.lower():
                     try:
@@ -689,7 +741,7 @@ def split_spreads(paths):
     """TPU only: splits double-page spreads into two portrait halves (one canvas shape)."""
     if not fixed_canvas():
         return list(paths), {}
-    split_dir = os.path.join(work_dir(), "split_pages")
+    split_dir = os.path.join(pages_dir(), "split_pages")
     os.makedirs(split_dir, exist_ok=True)
     queue, spreads = [], {}
     for p in paths:
@@ -715,7 +767,7 @@ def split_spreads(paths):
 
 
 def stitch_spreads(spreads):
-    out_dir = os.path.join(work_dir(), "generated")
+    out_dir = os.path.join(pages_dir(), "generated")
     for stem, (orig_w, orig_h) in spreads.items():
         left = os.path.join(out_dir, "edit_%s__spread_left.png" % stem)
         right = os.path.join(out_dir, "edit_%s__spread_right.png" % stem)
@@ -738,20 +790,32 @@ def stitch_spreads(spreads):
 
 
 def package_outputs():
-    """Zips generated/ so Kaggle serves one archive, and removes scratch files from the output."""
-    work = work_dir()
-    out_dir = os.path.join(work, "generated")
+    """Zips the colorized pages into one archive in /kaggle/working (encrypted when encryption
+    is on) and removes every scratch file. Returns the archive's file name."""
+    work, pages = work_dir(), pages_dir()
+    out_dir = os.path.join(pages, "generated")
+    archive = "generated.zip"
     if os.path.isdir(out_dir):
-        with zipfile.ZipFile(os.path.join(work, "generated.zip"), "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        plain = os.path.join(pages, "generated.zip")
+        with zipfile.ZipFile(plain, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for f in sorted(os.listdir(out_dir)):
                 zf.write(os.path.join(out_dir, f), arcname="generated/" + f)
         shutil.rmtree(out_dir, ignore_errors=True)
-    for name in ("split_pages", "input_pages", "loras", "colorize_worker.py"):
-        p = os.path.join(work, name)
-        if os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
-        elif os.path.isfile(p):
-            os.remove(p)
+        if encrypted():
+            import mcs_crypto
+            archive = "generated" + mcs_crypto.EXTENSION
+            mcs_crypto.encrypt_file(plain, os.path.join(work, archive), _KEY["value"])
+            os.remove(plain)
+        elif plain != os.path.join(work, archive):
+            shutil.move(plain, os.path.join(work, archive))
+    for base in {work, pages}:
+        for name in ("split_pages", "input_pages", "loras", "colorize_worker.py", "mcs_crypto.py"):
+            p = os.path.join(base, name)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            elif os.path.isfile(p):
+                os.remove(p)
+    return archive
 
 
 def spawn_workers(queue):
@@ -776,7 +840,12 @@ def main():
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
     os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "120")
     os.makedirs(work_dir(), exist_ok=True)
-    mark("Backend: %s | model: %s | %d LoRA(s)" % (backend(), _model_repo(), len(cfg("loras", []))))
+    os.makedirs(pages_dir(), exist_ok=True)
+    mark("Backend: %s | model: %s | %d LoRA(s)%s" % (backend(), _model_repo(), len(cfg("loras", [])),
+                                                     " | encrypted" if encrypted() else ""))
+    if encrypted():
+        load_key()  # fail in seconds, before any model download, if the secret is missing or wrong
+        mark("Encryption key verified (fingerprint %s)." % cfg("key_fingerprint"))
 
     if prepare_local_model():
         mark("Model found in mounted dataset; no download needed.")
@@ -798,5 +867,5 @@ def main():
     except Exception as e:
         mark("[Warning] Worker run ended with: %r" % e)
     stitch_spreads(spreads)
-    package_outputs()
-    mark("Outputs packaged into generated.zip")
+    archive = package_outputs()
+    mark("Outputs packaged into %s" % archive)

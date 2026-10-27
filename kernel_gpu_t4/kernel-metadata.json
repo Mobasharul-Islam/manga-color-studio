@@ -9,7 +9,8 @@
  "enable_tpu": "false",
  "enable_internet": "true",
  "dataset_sources": [
-  "rabiulislam5788/manga-color-scans",
+  "rabiulislam5788/manga-color-scans-enc",
+  "rabiulislam5788/mcs-key-8f44910e",
   "rabiulislam5788/models-manga-coloring",
   "rabiulislam5788/loras-manga-coloring-anima"
  ],

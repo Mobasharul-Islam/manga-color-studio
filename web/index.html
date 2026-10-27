@@ -148,6 +148,10 @@
           <button data-acc="tpu" role="radio">TPU v5e-8</button>
         </div>
         <p class="hint hardware-note" id="hardwareNote"></p>
+        <label class="switch-label" id="encryptRow" title="Set an encryption key under Accounts &amp; tokens to enable this">
+          <input type="checkbox" class="switch" id="encryptToggle">
+          <span>Encrypt scans &amp; results on Kaggle</span>
+        </label>
         <button class="btn btn-primary btn-block" id="colorizeBtn">Colorize chapter</button>
       </section>
     </aside>
@@ -340,6 +344,12 @@
         <span class="field-label">Hugging Face token <span class="hint">· optional, faster downloads</span> <span class="badge" id="hfBadge"></span></span>
         <input class="input" id="hfTokenInput" type="password" placeholder="hf_…" autocomplete="off">
       </label>
+
+      <label class="field">
+        <span class="field-label">Encryption key <span class="hint">· for scans &amp; results on Kaggle</span> <span class="badge" id="encBadge"></span></span>
+        <input class="input" id="encKeyInput" type="password" placeholder="At least 12 characters. Keep a copy: without it, results can't be decrypted." autocomplete="new-password">
+      </label>
+      <div class="enc-help" id="encHelp"></div>
 
       <p class="feedback" id="settingsFeedback" hidden></p>
 

@@ -1,5 +1,6 @@
 import io
 import os
+import zipfile
 import re
 import sys
 import glob
@@ -20,8 +21,9 @@ from pydantic import BaseModel
 from PIL import Image
 
 from scripts.common import (
-    ACCELERATORS, IMAGE_EXTS, SCANS_DATASET_SLUG, natural_key, safe_name, resolve_kaggle_username,
+    ACCELERATORS, IMAGE_EXTS, KEY_DATASET_PREFIX, natural_key, safe_name, resolve_kaggle_username, scans_dataset_slug,
 )
+from scripts import mcs_crypto
 from app import library, postprocess
 
 try:
@@ -38,6 +40,9 @@ SCRIPTS_DIR = BASE_DIR / "scripts"
 
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+from dotenv import load_dotenv
+load_dotenv(BASE_DIR / ".env")  # Kaggle/HF tokens and MCS_ENCRYPTION_KEY saved from the UI
 
 app = FastAPI(title="Manga Colorization TPU Studio")
 
@@ -109,6 +114,8 @@ class JobStartRequest(BaseModel):
     pages: List[str] = []
     # Key of scripts.common.ACCELERATORS: "tpu", "gpu_t4" or "gpu_p100".
     accelerator: str = "tpu"
+    # Encrypt the scans before upload and the results on Kaggle with MCS_ENCRYPTION_KEY.
+    encrypt: bool = False
 
 
 def _image_item(path: Path) -> Dict[str, Any]:
@@ -324,6 +331,7 @@ class SaveSettingsRequest(BaseModel):
     kaggle_username: Optional[str] = None
     kaggle_key: Optional[str] = None
     hf_token: Optional[str] = None
+    encryption_key: Optional[str] = None
 
 
 _kaggle_api = None
@@ -374,11 +382,15 @@ def get_settings_endpoint():
             is_authenticated = False
 
     hf_tok = os.getenv("HF_TOKEN", "")
+    enc_key = os.getenv("MCS_ENCRYPTION_KEY", "")
     return {
         "kaggle_authenticated": is_authenticated,
         "kaggle_username": username,
         "hf_token_configured": bool(hf_tok),
-        "hf_token_preview": (hf_tok[:6] + "..." + hf_tok[-4:]) if (hf_tok and len(hf_tok) > 10) else ""
+        "hf_token_preview": (hf_tok[:6] + "..." + hf_tok[-4:]) if (hf_tok and len(hf_tok) > 10) else "",
+        "encryption_key_configured": bool(enc_key),
+        # Non-secret identifier, so you can confirm Kaggle has the same key without revealing it.
+        "encryption_key_fingerprint": mcs_crypto.fingerprint(enc_key) if enc_key else "",
     }
 
 
@@ -419,6 +431,11 @@ def save_settings_endpoint(req: SaveSettingsRequest):
 
     if req.hf_token:
         os.environ["HF_TOKEN"] = req.hf_token.strip()
+    enc_key = (req.encryption_key or "").strip()
+    if enc_key:
+        if len(enc_key) < 12:
+            raise HTTPException(status_code=400, detail="Use an encryption key of at least 12 characters.")
+        os.environ["MCS_ENCRYPTION_KEY"] = enc_key
 
     # Update .env file
     env_file = BASE_DIR / ".env"
@@ -433,6 +450,8 @@ def save_settings_endpoint(req: SaveSettingsRequest):
                 continue
             if line.startswith("HF_TOKEN=") and req.hf_token:
                 continue
+            if line.startswith("MCS_ENCRYPTION_KEY=") and enc_key:
+                continue
             env_lines.append(line)
     
     if username:
@@ -443,11 +462,13 @@ def save_settings_endpoint(req: SaveSettingsRequest):
             env_lines.append(f"KAGGLE_API_TOKEN={key_or_token}")
     if req.hf_token:
         env_lines.append(f"HF_TOKEN={req.hf_token.strip()}")
+    if enc_key:
+        env_lines.append(f"MCS_ENCRYPTION_KEY={enc_key}")
 
     env_file.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
 
-    # Verify Kaggle authentication
-    api = get_kaggle_api_safe(verify_online=True)
+    # Verify Kaggle authentication (only rebuild the client if Kaggle credentials changed)
+    api = get_kaggle_api_safe(verify_online=bool(key_or_token))
     if api:
         u = get_kaggle_username()
         log_message(f"Kaggle API authenticated successfully as @{u}")
@@ -615,11 +636,15 @@ def merge_outputs(chapter_dir: Path, new_files: List[Path]) -> int:
     return replaced
 
 
-def upload_scans_dataset(api, kaggle_user: str, scans: List[Path], chapter_name: str):
-    """Zips the scans into the private scans dataset and waits until Kaggle has indexed it."""
+def upload_scans_dataset(api, kaggle_user: str, scans: List[Path], chapter_name: str, key: Optional[str] = None):
+    """Zips the scans (then encrypts the zip when a key is given) into the private scans dataset
+    and waits until Kaggle has indexed it."""
     import zipfile
 
-    dataset_full_slug = f"{kaggle_user}/{SCANS_DATASET_SLUG}"
+    if not scans:
+        raise RuntimeError("No scans to upload.")
+    slug = scans_dataset_slug(bool(key))
+    dataset_full_slug = f"{kaggle_user}/{slug}"
     with state_lock:
         job_state["phase_message"] = "Packaging & uploading scans to Kaggle..."
     log_message(f"Packaging {len(scans)} scans for Kaggle dataset '{dataset_full_slug}'...")
@@ -630,8 +655,13 @@ def upload_scans_dataset(api, kaggle_user: str, scans: List[Path], chapter_name:
     with zipfile.ZipFile(staging_dir / "scans.zip", "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for scan in scans:
             zf.write(scan, arcname=scan.name)
+    if key:
+        # Only the encrypted archive is uploaded; the readable zip never leaves this PC.
+        mcs_crypto.encrypt_file(staging_dir / "scans.zip", staging_dir / f"scans{mcs_crypto.EXTENSION}", key)
+        (staging_dir / "scans.zip").unlink()
+        log_message("Scans encrypted (AES-256-GCM) before upload.")
     with open(staging_dir / "dataset-metadata.json", "w", encoding="utf-8") as f:
-        json.dump({"title": SCANS_DATASET_SLUG, "id": dataset_full_slug, "licenses": [{"name": "CC0-1.0"}]}, f)
+        json.dump({"title": slug, "id": dataset_full_slug, "licenses": [{"name": "CC0-1.0"}]}, f)
 
     existing_datasets = []
     try:
@@ -657,8 +687,11 @@ def upload_scans_dataset(api, kaggle_user: str, scans: List[Path], chapter_name:
     log_message("Kaggle dataset upload submitted. Waiting for Kaggle backend to finish indexing...")
     with state_lock:
         job_state["phase_message"] = "Waiting for Kaggle dataset processing..."
+    wait_dataset_ready(api, dataset_full_slug, "Starting now would colorize the previous scans; please try again in a few minutes.")
 
-    # Poll until Kaggle marks the version ready, so the kernel never mounts the previous scans.
+
+def wait_dataset_ready(api, dataset_full_slug: str, timeout_hint: str):
+    """Polls until Kaggle marks the latest version ready, so the kernel never mounts an older one."""
     poll_interval = 4
     waited = 0
     while waited < DATASET_READY_TIMEOUT_S:
@@ -678,9 +711,75 @@ def upload_scans_dataset(api, kaggle_user: str, scans: List[Path], chapter_name:
             with state_lock:
                 job_state["phase_message"] = f"Kaggle indexing dataset ({waited}s)..."
     raise RuntimeError(
-        f"Kaggle did not finish indexing '{dataset_full_slug}' within {DATASET_READY_TIMEOUT_S // 60} minutes. "
-        "Starting now would colorize the previous scans; please try again in a few minutes."
+        f"Kaggle did not finish indexing '{dataset_full_slug}' within {DATASET_READY_TIMEOUT_S // 60} minutes. {timeout_hint}"
     )
+
+
+def new_key_dataset_ref(kaggle_user: str) -> str:
+    import secrets as pysecrets
+    return f"{kaggle_user}/{KEY_DATASET_PREFIX}{pysecrets.token_hex(4)}"  # fresh slug: Kaggle may hold deleted ones
+
+
+def upload_key_dataset(api, ref: str, key: str):
+    """Puts the encryption key in a new private dataset that only this run mounts; the job
+    deletes it when the run ends. The staging copy on this PC is removed right after upload."""
+    import tempfile
+
+    slug = ref.partition("/")[2]
+    with state_lock:
+        job_state["phase_message"] = "Sending the encryption key for this run..."
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / mcs_crypto.KEY_FILE).write_text(key, encoding="utf-8")
+        with open(Path(tmp) / "dataset-metadata.json", "w", encoding="utf-8") as f:
+            json.dump({"title": slug, "id": ref, "licenses": [{"name": "CC0-1.0"}]}, f)
+        res = api.dataset_create_new(tmp, dir_mode="zip", public=False, quiet=True)
+    if getattr(res, "error", None):
+        raise RuntimeError(f"Kaggle refused the temporary key dataset: {res.error}")
+    log_message(f"Encryption key sent as temporary private dataset '{ref}' (deleted when the run ends).")
+    wait_dataset_ready(api, ref, "Please try again in a few minutes.")
+
+
+def delete_key_datasets(api, kaggle_user: str, only: Optional[str] = None) -> int:
+    """Deletes this account's temporary key datasets: just `only` when given, else all of them
+    (leftovers of runs the app didn't see end)."""
+    deleted = 0
+    if only:
+        refs = [only]
+    else:
+        try:
+            refs = [getattr(d, "ref", "") or "" for d in api.dataset_list(user=kaggle_user, search=KEY_DATASET_PREFIX)]
+        except Exception as e:
+            log_message(f"WARNING: could not list temporary key datasets: {e}")
+            return 0
+    for ref in refs:
+        owner, _, slug = ref.partition("/")
+        if owner.lower() != kaggle_user.lower() or not slug.startswith(KEY_DATASET_PREFIX):
+            continue
+        try:
+            api.dataset_delete(owner, slug, no_confirm=True)
+            deleted += 1
+        except Exception as e:
+            if "404" in str(e) or "not found" in str(e).lower():
+                continue  # never got created
+            log_message(f"WARNING: could not delete temporary key dataset '{ref}': {e}. Delete it on kaggle.com.")
+    return deleted
+
+
+def _kernel_error_reason(sys_py: str, kaggle_user: str, slug: str) -> str:
+    """Last error line from a failed notebook's log (e.g. a missing Kaggle Secret)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run([sys_py, str(SCRIPTS_DIR / "download_fixed.py"), tmp, kaggle_user, slug],
+                       capture_output=True, text=True, cwd=BASE_DIR)
+        for log_file in Path(tmp).glob("*.log"):
+            try:
+                text = "".join(e.get("data", "") for e in json.loads(log_file.read_text(encoding="utf-8", errors="replace")))
+            except Exception:
+                continue
+            errors = re.findall(r"^\w*(?:Error|Exception): (.+)$", text, re.M)
+            if errors:
+                return errors[-1].strip()
+    return ""
 
 
 def monitor_kernel(sys_py: str, kernel_name: str, label: str):
@@ -732,6 +831,7 @@ def background_tpu_runner(req: JobStartRequest):
     safe_chapter = safe_name(req.chapter_name)
     chapter_dir = OUTPUT_DIR / safe_chapter
     acc = ACCELERATORS[req.accelerator]
+    api, kaggle_user, key_dataset = None, "", None
     try:
         with state_lock:
             job_state["status"] = "preparing"
@@ -772,7 +872,14 @@ def background_tpu_runner(req: JobStartRequest):
         with state_lock:
             job_state["total_images"] = len(scans)
 
-        upload_scans_dataset(api, kaggle_user, scans, safe_chapter)
+        key = os.getenv("MCS_ENCRYPTION_KEY", "") if req.encrypt else ""
+        if req.encrypt and not key:
+            raise RuntimeError("Encryption is on but no encryption key is set. Add one under Accounts & tokens.")
+        upload_scans_dataset(api, kaggle_user, scans, safe_chapter, key or None)
+        if key:
+            delete_key_datasets(api, kaggle_user)  # leftovers of a run the app didn't see end
+            key_dataset = new_key_dataset_ref(kaggle_user)
+            upload_key_dataset(api, key_dataset, key)
 
         # 2. Build lightweight notebook with the library's model, enabled LoRAs & settings
         from scripts.make_notebook import build_notebook
@@ -790,8 +897,10 @@ def background_tpu_runner(req: JobStartRequest):
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
             accelerator=req.accelerator,
+            key_fingerprint=mcs_crypto.fingerprint(key) if key else None,
+            key_dataset=key_dataset,
         )
-        log_message("Notebook successfully compiled.")
+        log_message("Notebook successfully compiled." + (" Scans and results are encrypted." if key else ""))
 
         # 3. Push to Kaggle
         with state_lock:
@@ -806,7 +915,11 @@ def background_tpu_runner(req: JobStartRequest):
             raise RuntimeError(f"Kaggle push failed: {(push_res.stderr or push_res.stdout).strip()}")
 
         # 4. Monitor Kaggle Kernel execution
-        monitor_kernel(sys_py, f"{kaggle_user}/{acc['slug']}", acc["label"])
+        try:
+            monitor_kernel(sys_py, f"{kaggle_user}/{acc['slug']}", acc["label"])
+        except RuntimeError as e:
+            reason = _kernel_error_reason(sys_py, kaggle_user, acc["slug"]) if "failed with status" in str(e) else ""
+            raise RuntimeError(f"The Kaggle notebook failed: {reason}" if reason else str(e))
 
         # 5. Download results into a scratch folder, then merge into the chapter
         with state_lock:
@@ -824,6 +937,16 @@ def background_tpu_runner(req: JobStartRequest):
 
         for log_file in download_dir.glob("*.log"):
             shutil.copy2(log_file, chapter_dir / log_file.name)
+        if key:
+            encrypted_out = download_dir / f"generated{mcs_crypto.EXTENSION}"
+            if not encrypted_out.is_file():
+                raise RuntimeError(f"The kernel finished but returned no encrypted results. See the logs in {chapter_dir}.")
+            plain = download_dir / "generated.zip"
+            mcs_crypto.decrypt_file(encrypted_out, plain, key)
+            with zipfile.ZipFile(plain) as zf:
+                zf.extractall(download_dir)
+            plain.unlink()
+            log_message("Results decrypted.")
         new_files = sorted((download_dir / "generated").glob("*.png"))
         if not new_files:
             raise RuntimeError(f"The kernel finished but produced no images. See the logs in {chapter_dir}.")
@@ -855,6 +978,29 @@ def background_tpu_runner(req: JobStartRequest):
             job_state["status"] = "error"
             job_state["phase_message"] = "Colorization Failed"
             job_state["error"] = err_msg
+    finally:
+        # The key leaves Kaggle as soon as the run is over, whatever the outcome.
+        if key_dataset and api:
+            if delete_key_datasets(api, kaggle_user, only=key_dataset):
+                log_message("Temporary key dataset deleted from Kaggle.")
+
+
+@app.on_event("startup")
+def _cleanup_key_datasets_on_startup():
+    """A run the app didn't see end (closed mid-run) can leave its key dataset behind."""
+    def work():
+        api = get_kaggle_api_safe()
+        if not api:
+            return
+        try:
+            user = get_kaggle_username()
+        except RuntimeError:
+            return
+        with state_lock:
+            busy = job_state["status"] in ["preparing", "pushing", "queued", "running", "downloading"]
+        if not busy and delete_key_datasets(api, user):
+            log_message("Deleted temporary key dataset(s) left on Kaggle by an earlier run.")
+    threading.Thread(target=work, daemon=True).start()
 
 
 @app.post("/api/start")
@@ -865,6 +1011,8 @@ def start_colorization_job(req: JobStartRequest, background_tasks: BackgroundTas
         library.run_spec()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if req.encrypt and not os.getenv("MCS_ENCRYPTION_KEY"):
+        raise HTTPException(status_code=400, detail="Set an encryption key under Accounts & tokens first, or turn encryption off.")
     with state_lock:
         if job_state["status"] in ["preparing", "pushing", "queued", "running", "downloading"]:
             raise HTTPException(status_code=400, detail="A colorization job is already in progress.")

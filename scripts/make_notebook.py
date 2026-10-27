@@ -16,14 +16,16 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 load_dotenv(BASE_DIR / ".env")
 
-from scripts.common import ACCELERATORS, SCANS_DATASET_SLUG, resolve_kaggle_username
+from scripts import mcs_crypto
+from scripts.common import ACCELERATORS, resolve_kaggle_username, scans_dataset_slug
 
 WORKER_FILE = BASE_DIR / "scripts" / "colorize_worker.py"
+CRYPTO_FILE = BASE_DIR / "scripts" / "mcs_crypto.py"
 DEFAULT_PROMPT = "masterpiece, best quality, anime style, highly detailed coloring, vibrant color harmony, crisp lineart"
 DEFAULT_NEGATIVE = "worst quality, low quality, blurry, artifact, oversaturated, deformed, greyscale, monochrome"
 
 INSTALL_CELL = [
-    "!pip uninstall -y -q google-tunix 2>/dev/null; pip install -q --upgrade \"transformers==5.15.0\" \"tokenizers==0.22.2\" accelerate safetensors peft kaggle\n",
+    "!pip uninstall -y -q google-tunix 2>/dev/null; pip install -q --upgrade \"transformers==5.15.0\" \"tokenizers==0.22.2\" accelerate safetensors peft kaggle cryptography\n",
     "!pip install --upgrade \"huggingface_hub @ git+https://github.com/huggingface/huggingface_hub.git@f34cd32cac1f3603e3294543e1fb0eb4508d5139\" \"diffusers @ git+https://github.com/huggingface/diffusers.git@102c24934fe1705e6caaadb03789b0f2542fd8a9\"\n",
 ]
 
@@ -58,6 +60,27 @@ for i in range(torch.cuda.device_count()):
 """
 
 
+# Runs before the installs, so a missing or wrong key stops the run in seconds instead of
+# after minutes of GPU time. Same check as colorize_worker.load_key(), standard library only.
+KEY_CHECK = """import hashlib, os
+_key = ''
+for _root, _dirs, _files in os.walk('/kaggle/input'):
+    if %(name)r in _files:
+        with open(os.path.join(_root, %(name)r), encoding='utf-8') as _f:
+            _key = _f.read().strip()
+        break
+if not _key:
+    raise RuntimeError('Encryption is on, but the temporary key dataset is not mounted in this notebook. '
+                       'Start the run again from the app.')
+_fp = hashlib.sha256(b'mcs-fingerprint:' + _key.encode('utf-8')).hexdigest()[:12]
+if _fp != %(fp)r:
+    raise RuntimeError('The mounted encryption key is not the key set in the app (fingerprints %%s vs %%s). '
+                       'Start the run again from the app.' %% (_fp, %(fp)r))
+del _key
+print('Encryption key verified (fingerprint %%s).' %% _fp)
+"""
+
+
 def _code_cell(source: str) -> Dict[str, Any]:
     return {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
             "source": [line + "\n" for line in source.splitlines()]}
@@ -74,7 +97,11 @@ def build_notebook(
     negative_prompt: str = "",
     accelerator: str = "tpu",
     out_notebook_path: Optional[str] = None,
+    key_fingerprint: Optional[str] = None,
+    key_dataset: Optional[str] = None,
 ):
+    """key_fingerprint set = encrypted run: scans arrive and results leave AES-encrypted. The key
+    comes from key_dataset, a private dataset the app creates for this run and deletes after it."""
     acc = ACCELERATORS[accelerator]
     max_dim = min(int(max_dim), 1440)
 
@@ -99,7 +126,9 @@ def build_notebook(
     kuser = resolve_kaggle_username(api)
 
     # Mount the scans, the selected model's dataset and the datasets of the enabled LoRAs.
-    dataset_sources = [f"{kuser}/{SCANS_DATASET_SLUG}"]
+    dataset_sources = [f"{kuser}/{scans_dataset_slug(bool(key_fingerprint))}"]
+    if key_dataset:
+        dataset_sources.append(key_dataset)
     for ref in [model.get("dataset")] + [l.get("dataset") for l in loras]:
         if ref and ref not in dataset_sources:
             dataset_sources.append(ref)
@@ -114,16 +143,22 @@ def build_notebook(
         "guidance_scale": float(guidance_scale),
         "prompt": (prompt or "").strip() or DEFAULT_PROMPT,
         "negative_prompt": (negative_prompt or "").strip() or DEFAULT_NEGATIVE,
+        "encrypted": bool(key_fingerprint),
+        "key_fingerprint": key_fingerprint,
     }
     # JSON parsed at runtime: the settings never have to be valid Python literals.
     worker_source = f"import json\nCONFIG = json.loads({json.dumps(config)!r})\n\n" + WORKER_FILE.read_text(encoding="utf-8")
+    # Code goes to /tmp, not /kaggle/working, so it never ends up in the saved output.
     run_cell = (
-        "import sys\n"
+        "import os, sys\n"
         f"WORKER_SOURCE = {worker_source!r}\n"
-        "with open('/kaggle/working/colorize_worker.py', 'w', encoding='utf-8') as f:\n"
-        "    f.write(WORKER_SOURCE)\n"
-        "if '/kaggle/working' not in sys.path:\n"
-        "    sys.path.insert(0, '/kaggle/working')\n"
+        f"CRYPTO_SOURCE = {CRYPTO_FILE.read_text(encoding='utf-8')!r}\n"
+        "os.makedirs('/tmp/mcs_code', exist_ok=True)\n"
+        "for name, src in (('colorize_worker.py', WORKER_SOURCE), ('mcs_crypto.py', CRYPTO_SOURCE)):\n"
+        "    with open(os.path.join('/tmp/mcs_code', name), 'w', encoding='utf-8') as f:\n"
+        "        f.write(src)\n"
+        "if '/tmp/mcs_code' not in sys.path:\n"
+        "    sys.path.insert(0, '/tmp/mcs_code')\n"
         "import colorize_worker\n"
         "colorize_worker.main()\n"
     )
@@ -135,6 +170,7 @@ def build_notebook(
             "Generated by Manga Color Studio. The worker code is `scripts/colorize_worker.py` in the app;\n",
             "this run's settings are in its `CONFIG` line.\n",
         ]},
+        *([_code_cell(KEY_CHECK % {"name": mcs_crypto.KEY_FILE, "fp": key_fingerprint})] if key_fingerprint else []),
         {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": INSTALL_CELL},
         _code_cell(ENV_CHECK + (TPU_ENV_CHECK if acc["backend"] == "tpu" else GPU_ENV_CHECK)),
         _code_cell(run_cell),

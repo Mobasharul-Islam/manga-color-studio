@@ -30,6 +30,22 @@
         "7880"
       ],
       "port": 7880
+    },
+    {
+      "name": "decrypter",
+      "runtimeExecutable": "C:\\Users\\mobas\\Desktop\\Games\\Manga-Color\\decrypter\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "-m",
+        "uvicorn",
+        "app.server:app",
+        "--app-dir",
+        "C:\\Users\\mobas\\Desktop\\Games\\Manga-Color\\decrypter",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "7890"
+      ],
+      "port": 7890
     }
   ]
 }

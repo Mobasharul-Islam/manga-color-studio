@@ -1,6 +1,7 @@
-// Accounts & tokens dialog: Kaggle credentials and the optional Hugging Face token.
+// Accounts & tokens dialog: Kaggle credentials, the optional Hugging Face token and the
+// encryption key for scans & results stored on Kaggle.
 
-import { $, $$, api, dropTarget, emit } from './ui.js';
+import { $, $$, esc, api, dropTarget, emit } from './ui.js';
 
 function feedback(text, ok) {
   const el = $('#settingsFeedback');
@@ -23,6 +24,14 @@ export async function refreshAccount() {
   $('#hfBadge').textContent = s.hf_token_configured ? (s.hf_token_preview || 'set') : 'not set';
   $('#hfBadge').className = `badge ${s.hf_token_configured ? 'ok' : ''}`;
   if (ok && !$('#kaggleUserInput').value) $('#kaggleUserInput').value = s.kaggle_username;
+
+  $('#encBadge').textContent = s.encryption_key_configured ? `set · ${s.encryption_key_fingerprint}` : 'not set';
+  $('#encBadge').className = `badge ${s.encryption_key_configured ? 'ok' : ''}`;
+  $('#encBadge').title = s.encryption_key_configured
+    ? 'Fingerprint of your key. Each run checks that the notebook received this same key.' : '';
+  $('#encHelp').textContent = s.encryption_key_configured
+    ? 'Nothing to set up on Kaggle: each encrypted run sends this key as a temporary private dataset that the app deletes when the run ends. Keep a copy of the key: without it, encrypted results cannot be decrypted.'
+    : '';
   return s;
 }
 
@@ -71,11 +80,13 @@ export async function initSettings() {
           kaggle_username: $('#kaggleUserInput').value.trim() || null,
           kaggle_key: $('#kaggleKeyInput').value.trim() || null,
           hf_token: $('#hfTokenInput').value.trim() || null,
+          encryption_key: $('#encKeyInput').value.trim() || null,
         },
       });
       feedback(data.message, data.status === 'success');
       $('#kaggleKeyInput').value = '';
       $('#hfTokenInput').value = '';
+      $('#encKeyInput').value = '';
       await refreshAccount();
       emit('account:changed');
     } catch (err) {

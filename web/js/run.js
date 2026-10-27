@@ -110,6 +110,22 @@ async function loadQuota() {
   renderHardware();
 }
 
+// ------------------------------------------------------------------ encryption
+
+// The switch works only once a key is saved under Accounts & tokens; the choice is remembered.
+async function loadEncryption() {
+  let ready = false;
+  try {
+    ready = !!(await api('/api/settings')).encryption_key_configured;
+  } catch { /* server not reachable: leave it off */ }
+  const toggle = $('#encryptToggle');
+  toggle.disabled = !ready;
+  toggle.checked = ready && store.get('mcs.encrypt', 'true') !== 'false';
+  $('#encryptRow').title = ready
+    ? 'Scans are encrypted before upload and results stay encrypted on Kaggle'
+    : 'Set an encryption key under Accounts & tokens to enable this';
+}
+
 // ------------------------------------------------------------------ starting jobs
 
 export function buildPayload(overrides = {}) {
@@ -121,6 +137,7 @@ export function buildPayload(overrides = {}) {
     prompt: $('#promptInput').value.trim(),
     negative_prompt: $('#negativeInput').value.trim(),
     accelerator: hardware(),
+    encrypt: $('#encryptToggle').checked && !$('#encryptToggle').disabled,
     ...overrides,
   };
 }
@@ -248,6 +265,10 @@ export async function initRun() {
   });
   renderHardware();
   loadQuota();
+
+  loadEncryption();
+  $('#encryptToggle').addEventListener('change', e => store.set('mcs.encrypt', String(e.target.checked)));
+  on('account:changed', loadEncryption);
 
   $('#colorizeBtn').addEventListener('click', () => {
     const { pages } = getChapter();

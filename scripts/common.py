@@ -8,6 +8,19 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 # Private Kaggle dataset that carries the scans of the chapter being colorized.
 SCANS_DATASET_SLUG = "manga-color-scans"
+# Encrypted runs use their own dataset: the plain one keeps unencrypted scans in its version history.
+ENCRYPTED_SCANS_DATASET_SLUG = "manga-color-scans-enc"
+
+
+# Prefix of the private one-run datasets that carry the encryption key to the notebook; the app
+# deletes each one when its run ends.
+KEY_DATASET_PREFIX = "mcs-key-"
+
+
+def scans_dataset_slug(encrypted: bool) -> str:
+    return ENCRYPTED_SCANS_DATASET_SLUG if encrypted else SCANS_DATASET_SLUG
+
+
 KERNEL_SLUG = "tpu-image-generation-anima-base-1-0-2b"
 
 # Hardware a colorization run can use. Each gets its own Kaggle notebook, so a run queued on
